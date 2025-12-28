@@ -79,6 +79,11 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2_klein",
         "Flux2KleinPipeline",
     ),
+    "HunyuanVideoI2VPipeline": (
+        "hunyuan_video_i2v",
+        "pipeline_hunyuan_video_i2v",
+        "HunyuanVideoI2VPipeline",
+    ),
 }
 
 
@@ -127,6 +132,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "HunyuanVideoI2VPipeline": "get_hunyuan_video_i2v_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -139,6 +145,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "HunyuanVideoI2VPipeline": "get_hunyuan_video_i2v_pre_process_func",
 }
 
 
