@@ -25,6 +25,7 @@ th {
 | `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` |
 |`ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` |
 | `WanPipeline` | Wan2.2 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
+| `HunyuanVideoI2VPipeline` | HunyuanVideo-I2V | `Tencent/HunyuanVideo-I2V` |
 | `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` |
 |`LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` |
 |`LongCatImageEditPipeline` | LongCat-Image-Edit | `meituan-longcat/LongCat-Image-Edit` |
