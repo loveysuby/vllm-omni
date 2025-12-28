@@ -54,6 +54,11 @@ _DIFFUSION_MODELS = {
         "pipeline_longcat_image_edit",
         "LongcatImageEditPipeline",
     ),
+    "HunyuanVideoI2VPipeline": (
+        "hunyuan_video_i2v",
+        "pipeline_hunyuan_video_i2v",
+        "HunyuanVideoI2VPipeline",
+    ),
 }
 
 
@@ -96,6 +101,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
+    "HunyuanVideoI2VPipeline": "get_hunyuan_video_i2v_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -106,6 +112,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_pre_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
+    "HunyuanVideoI2VPipeline": "get_hunyuan_video_i2v_pre_process_func",
 }
 
 
