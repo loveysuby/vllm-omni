@@ -44,6 +44,11 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2",
         "Wan22Pipeline",
     ),
+    "StableAudioPipeline": (
+        "stable_audio",
+        "pipeline_stable_audio",
+        "StableAudioPipeline",
+    ),
     "WanImageToVideoPipeline": (
         "wan2_2",
         "pipeline_wan2_2_i2v",
@@ -54,10 +59,15 @@ _DIFFUSION_MODELS = {
         "pipeline_longcat_image",
         "LongCatImagePipeline",
     ),
+    "BagelPipeline": (
+        "bagel",
+        "pipeline_bagel",
+        "BagelPipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
-        "LongcatImageEditPipeline",
+        "LongCatImageEditPipeline",
     ),
     "HunyuanVideoI2VPipeline": (
         "hunyuan_video_i2v",
@@ -68,6 +78,16 @@ _DIFFUSION_MODELS = {
         "sd3",
         "pipeline_sd3",
         "StableDiffusion3Pipeline",
+    ),
+    "Flux2KleinPipeline": (
+        "flux2_klein",
+        "pipeline_flux2_klein",
+        "Flux2KleinPipeline",
+    ),
+    "HunyuanVideoI2VPipeline": (
+        "hunyuan_video_i2v",
+        "pipeline_hunyuan_video_i2v",
+        "HunyuanVideoI2VPipeline",
     ),
 }
 
@@ -94,6 +114,7 @@ def initialize_model(
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
+
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
@@ -109,11 +130,15 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
+    "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
+    "BagelPipeline": "get_bagel_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "HunyuanVideoI2VPipeline": "get_hunyuan_video_i2v_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
+    "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "HunyuanVideoI2VPipeline": "get_hunyuan_video_i2v_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -127,6 +152,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HunyuanVideoI2VPipeline": "get_hunyuan_video_i2v_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "HunyuanVideoI2VPipeline": "get_hunyuan_video_i2v_pre_process_func",
 }
 
 
