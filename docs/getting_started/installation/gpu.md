@@ -61,6 +61,10 @@ vLLM-Omni is a Python library that supports the following GPU variants. The libr
 
 ### Build your own docker image
 
+=== "NVIDIA CUDA"
+
+    --8<-- "docs/getting_started/installation/gpu/cuda.inc.md:build-docker"
+
 === "AMD ROCm"
 
     --8<-- "docs/getting_started/installation/gpu/rocm.inc.md:build-docker"
