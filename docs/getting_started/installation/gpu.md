@@ -63,6 +63,10 @@ Note: Pre-built wheels are currently only available for vLLM-Omni 0.11.0rc1, 0.1
 
 ### Build your own docker image
 
+=== "NVIDIA CUDA"
+
+    --8<-- "docs/getting_started/installation/gpu/cuda.inc.md:build-docker"
+
 === "AMD ROCm"
 
     --8<-- "docs/getting_started/installation/gpu/rocm.inc.md:build-docker"

@@ -99,3 +99,48 @@ docker run --runtime nvidia --gpus 2 \
     You can use this docker image to serve models the same way you would with in vLLM! To do so, make sure you overwrite the default entrypoint (`vllm serve --omni`) which works only for models supported in the vLLM-Omni project.
 
 # --8<-- [end:pre-built-images]
+
+# --8<-- [start:build-docker]
+
+#### Build docker image
+
+```bash
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.ci -t vllm-omni-cuda .
+```
+
+If you want to specify the base vLLM version:
+
+```bash
+DOCKER_BUILDKIT=1 docker build \
+  -f docker/Dockerfile.ci \
+  --build-arg VLLM_BASE_TAG=v0.15.0 \
+  -t vllm-omni-cuda .
+```
+
+#### Launch the docker image
+
+##### Launch with OpenAI API Server
+
+```bash
+docker run --runtime nvidia --gpus all \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --env "HF_TOKEN=$HF_TOKEN" \
+  -p 8091:8091 \
+  --ipc=host \
+  vllm-omni-cuda \
+  vllm serve --omni --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
+```
+
+##### Launch with interactive session for development
+
+```bash
+docker run --runtime nvidia --gpus all -it \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --env "HF_TOKEN=$HF_TOKEN" \
+  -p 8091:8091 \
+  --ipc=host \
+  --entrypoint bash \
+  vllm-omni-cuda
+```
+
+# --8<-- [end:build-docker]
