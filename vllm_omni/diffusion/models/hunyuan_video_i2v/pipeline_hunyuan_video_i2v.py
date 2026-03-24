@@ -183,7 +183,7 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         )
 
         self.vae = AutoencoderKLHunyuanVideo.from_pretrained(
-            model, subfolder="vae", dtype=torch.float32, local_files_only=local_files_only,
+            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only,
         ).to(self.device)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
