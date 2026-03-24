@@ -11,7 +11,7 @@ from typing import Any, cast
 import numpy as np
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLHunyuanVideo
+from diffusers import AutoencoderKLHunyuanVideo, HunyuanVideoTransformer3DModel
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
@@ -28,11 +28,8 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.hunyuan_video_i2v.hunyuan_video_transformer import HunyuanVideoTransformer3DModel
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -192,18 +189,14 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         if od_config.flow_shift is not None:
             self.scheduler._shift = od_config.flow_shift
 
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, HunyuanVideoTransformer3DModel)
-        self.transformer = HunyuanVideoTransformer3DModel(od_config=od_config, **transformer_kwargs)
+        self.transformer = HunyuanVideoTransformer3DModel.from_pretrained(
+            model, subfolder="transformer", torch_dtype=dtype, local_files_only=local_files_only,
+        ).to(self.device)
 
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
-                revision=None,
-                prefix="transformer.",
-                fall_back_to_pt=True,
-            ),
-        ]
+        print(f"[DEBUG] Transformer config: image_condition_type={self.transformer.config.image_condition_type}")
+        print(f"[DEBUG] Transformer config: guidance_embeds={self.transformer.config.guidance_embeds}")
+
+        self.weights_sources = []
 
         self.vae_scaling_factor = self.vae.config.scaling_factor if hasattr(self.vae, "config") else 0.476986
         self.vae_scale_factor_temporal = (
@@ -417,6 +410,10 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         latents = latents * t_init + image_latents * (1 - t_init)
 
         image_latents = image_latents[:, :, :1]
+
+        print(f"[DEBUG] prepare_latents: latents shape={latents.shape}, image_latents shape={image_latents.shape}")
+        print(f"[DEBUG] prepare_latents: num_latent_frames={num_latent_frames}, latent_h={latent_height}, latent_w={latent_width}")
+
         return latents, image_latents
 
     def predict_noise(self, **kwargs: Any) -> torch.Tensor:
@@ -522,11 +519,18 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 [guidance_scale] * batch_size, dtype=dtype, device=device,
             ) * 1000.0
 
+        print(f"[DEBUG] Starting denoising loop: num_steps={num_steps}, timesteps={timesteps[:3].tolist()}...")
+        print(f"[DEBUG] prompt_embeds shape={prompt_embeds.shape}, pooled shape={pooled_prompt_embeds.shape}")
+        print(f"[DEBUG] prompt_attention_mask shape={prompt_attention_mask.shape}, sum={prompt_attention_mask.sum().item()}")
+
         for i, t in enumerate(timesteps):
             self._current_timestep = t
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
             latent_model_input = torch.cat([image_latents, latents[:, :, 1:]], dim=2).to(dtype)
+
+            if i == 0:
+                print(f"[DEBUG] Step 0: latent_model_input shape={latent_model_input.shape}, timestep={t.item():.4f}")
 
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
@@ -550,19 +554,28 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 )[0]
                 noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
+            if i == 0:
+                print(f"[DEBUG] Step 0: noise_pred shape={noise_pred.shape}, range=[{noise_pred.min():.4f}, {noise_pred.max():.4f}]")
+
             denoised = self.scheduler.step(noise_pred[:, :, 1:], t, latents[:, :, 1:], return_dict=False)[0]
             latents = torch.cat([image_latents, denoised], dim=2)
+
+            if i == 0:
+                print(f"[DEBUG] Step 0: denoised shape={denoised.shape}, range=[{denoised.min():.4f}, {denoised.max():.4f}]")
 
         self._current_timestep = None
 
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
 
+        print(f"[DEBUG] Denoising done. Final latents shape={latents.shape}, range=[{latents.min():.4f}, {latents.max():.4f}]")
+
         if output_type == "latent":
             output = latents
         else:
             latents = latents.to(self.vae.dtype) / self.vae_scaling_factor
             output = self.vae.decode(latents, return_dict=False)[0]
+            print(f"[DEBUG] VAE decoded output shape={output.shape}, range=[{output.min():.4f}, {output.max():.4f}]")
 
         return DiffusionOutput(output=output)
 
