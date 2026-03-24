@@ -197,8 +197,8 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         )
         self.transformer = HunyuanVideoTransformer3DModel(od_config=od_config, **transformer_kwargs)
 
-        print(f"[DEBUG] Transformer: image_condition_type={self.transformer.image_condition_type}")
-        print(f"[DEBUG] Transformer: guidance_embeds={self.transformer.guidance_embeds}")
+        logger.debug("Transformer: image_condition_type=%s", self.transformer.image_condition_type)
+        logger.debug("Transformer: guidance_embeds=%s", self.transformer.guidance_embeds)
 
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -292,12 +292,12 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             image_token_index, image_emb_len, image_emb_start, image_emb_end, pad_token_id,
         )
 
-        print(f"[DEBUG] prompt: {prompt}")
-        print(f"[DEBUG] text_input_ids shape: {text_input_ids.shape}")
-        print(f"[DEBUG] expanded input_ids shape: {expanded['input_ids'].shape}")
-        print(f"[DEBUG] num image tokens in expanded: {(expanded['input_ids'] == image_token_index).sum().item()}")
-        print(f"[DEBUG] pixel_values shape: {image_embeds.shape}")
-        print(f"[DEBUG] image_token_index: {image_token_index}, image_emb_len: {image_emb_len}")
+        logger.debug("prompt: %s", prompt)
+        logger.debug("text_input_ids shape: %s", text_input_ids.shape)
+        logger.debug("expanded input_ids shape: %s", expanded["input_ids"].shape)
+        logger.debug("num image tokens in expanded: %d", (expanded["input_ids"] == image_token_index).sum().item())
+        logger.debug("pixel_values shape: %s", image_embeds.shape)
+        logger.debug("image_token_index: %s, image_emb_len: %s", image_token_index, image_emb_len)
 
         prompt_embeds = self.text_encoder(
             **expanded, pixel_values=image_embeds, output_hidden_states=True,
@@ -423,8 +423,9 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
         image_latents = image_latents[:, :, :1]
 
-        print(f"[DEBUG] prepare_latents: latents shape={latents.shape}, image_latents shape={image_latents.shape}")
-        print(f"[DEBUG] prepare_latents: num_latent_frames={num_latent_frames}, latent_h={latent_height}, latent_w={latent_width}")
+        logger.debug("prepare_latents: latents shape=%s, image_latents shape=%s", latents.shape, image_latents.shape)
+        logger.debug("prepare_latents: num_latent_frames=%d, latent_h=%d, latent_w=%d",
+                      num_latent_frames, latent_height, latent_width)
 
         return latents, image_latents
 
@@ -531,9 +532,10 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 [guidance_scale] * batch_size, dtype=dtype, device=device,
             ) * 1000.0
 
-        print(f"[DEBUG] Starting denoising loop: num_steps={num_steps}, timesteps={timesteps[:3].tolist()}...")
-        print(f"[DEBUG] prompt_embeds shape={prompt_embeds.shape}, pooled shape={pooled_prompt_embeds.shape}")
-        print(f"[DEBUG] prompt_attention_mask shape={prompt_attention_mask.shape}, sum={prompt_attention_mask.sum().item()}")
+        logger.debug("Starting denoising loop: num_steps=%d, timesteps=%s...", num_steps, timesteps[:3].tolist())
+        logger.debug("prompt_embeds shape=%s, pooled shape=%s", prompt_embeds.shape, pooled_prompt_embeds.shape)
+        logger.debug("prompt_attention_mask shape=%s, sum=%s",
+                     prompt_attention_mask.shape, prompt_attention_mask.sum().item())
 
         for i, t in enumerate(timesteps):
             self._current_timestep = t
@@ -542,7 +544,7 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             latent_model_input = torch.cat([image_latents, latents[:, :, 1:]], dim=2).to(dtype)
 
             if i == 0:
-                print(f"[DEBUG] Step 0: latent_model_input shape={latent_model_input.shape}, timestep={t.item():.4f}")
+                logger.debug("Step 0: latent_model_input shape=%s, timestep=%.4f", latent_model_input.shape, t.item())
 
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
@@ -567,27 +569,33 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
             if i == 0:
-                print(f"[DEBUG] Step 0: noise_pred shape={noise_pred.shape}, range=[{noise_pred.min():.4f}, {noise_pred.max():.4f}]")
+                logger.debug("Step 0: noise_pred shape=%s, range=[%.4f, %.4f]",
+                             noise_pred.shape, noise_pred.min(), noise_pred.max())
 
             denoised = self.scheduler.step(noise_pred[:, :, 1:], t, latents[:, :, 1:], return_dict=False)[0]
             latents = torch.cat([image_latents, denoised], dim=2)
 
             if i == 0:
-                print(f"[DEBUG] Step 0: denoised shape={denoised.shape}, range=[{denoised.min():.4f}, {denoised.max():.4f}]")
+                if denoised.numel() > 0:
+                    logger.debug("Step 0: denoised shape=%s, range=[%.4f, %.4f]",
+                                 denoised.shape, denoised.min(), denoised.max())
+                else:
+                    logger.debug("Step 0: denoised shape=%s (empty, dummy run with 1 frame)", denoised.shape)
 
         self._current_timestep = None
 
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
 
-        print(f"[DEBUG] Denoising done. Final latents shape={latents.shape}, range=[{latents.min():.4f}, {latents.max():.4f}]")
+        logger.debug("Denoising done. Final latents shape=%s, range=[%.4f, %.4f]",
+                     latents.shape, latents.min(), latents.max())
 
         if output_type == "latent":
             output = latents
         else:
             latents = latents.to(self.vae.dtype) / self.vae_scaling_factor
             output = self.vae.decode(latents, return_dict=False)[0]
-            print(f"[DEBUG] VAE decoded output shape={output.shape}, range=[{output.min():.4f}, {output.max():.4f}]")
+            logger.debug("VAE decoded output shape=%s, range=[%.4f, %.4f]", output.shape, output.min(), output.max())
 
         return DiffusionOutput(output=output)
 
