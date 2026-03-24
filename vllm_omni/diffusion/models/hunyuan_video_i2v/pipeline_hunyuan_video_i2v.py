@@ -11,7 +11,7 @@ from typing import Any, cast
 import numpy as np
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLHunyuanVideo, HunyuanVideoTransformer3DModel
+from diffusers import AutoencoderKLHunyuanVideo
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
@@ -28,8 +28,11 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.hunyuan_video_i2v.hunyuan_video_transformer import HunyuanVideoTransformer3DModel
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
@@ -189,14 +192,23 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         if od_config.flow_shift is not None:
             self.scheduler._shift = od_config.flow_shift
 
-        self.transformer = HunyuanVideoTransformer3DModel.from_pretrained(
-            model, subfolder="transformer", torch_dtype=dtype, local_files_only=local_files_only,
-        ).to(self.device)
+        transformer_kwargs = get_transformer_config_kwargs(
+            od_config.tf_model_config, HunyuanVideoTransformer3DModel,
+        )
+        self.transformer = HunyuanVideoTransformer3DModel(od_config=od_config, **transformer_kwargs)
 
-        print(f"[DEBUG] Transformer config: image_condition_type={self.transformer.config.image_condition_type}")
-        print(f"[DEBUG] Transformer config: guidance_embeds={self.transformer.config.guidance_embeds}")
+        print(f"[DEBUG] Transformer: image_condition_type={self.transformer.image_condition_type}")
+        print(f"[DEBUG] Transformer: guidance_embeds={self.transformer.guidance_embeds}")
 
-        self.weights_sources = []
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model,
+                subfolder="transformer",
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            ),
+        ]
 
         self.vae_scaling_factor = self.vae.config.scaling_factor if hasattr(self.vae, "config") else 0.476986
         self.vae_scale_factor_temporal = (
