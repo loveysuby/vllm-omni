@@ -28,7 +28,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
@@ -1035,5 +1035,42 @@ class HunyuanVideoTransformer3DModel(nn.Module):
         return Transformer2DModelOutput(sample=hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        stacked_params_mapping = [
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
+            (".add_kv_proj", ".add_q_proj", "q"),
+            (".add_kv_proj", ".add_k_proj", "k"),
+            (".add_kv_proj", ".add_v_proj", "v"),
+        ]
+
+        params_dict = dict(self.named_parameters())
+        for name, buffer in self.named_buffers():
+            if name.endswith(".beta") or name.endswith(".eps"):
+                params_dict[name] = buffer
+
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            original_name = name
+            lookup_name = name
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in original_name:
+                    continue
+                lookup_name = original_name.replace(weight_name, param_name)
+                if lookup_name not in params_dict:
+                    break
+                param = params_dict[lookup_name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                if lookup_name not in params_dict and ".to_out.0." in lookup_name:
+                    lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
+                if lookup_name not in params_dict:
+                    continue
+                param = params_dict[lookup_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(original_name)
+            loaded_params.add(lookup_name)
+        return loaded_params
