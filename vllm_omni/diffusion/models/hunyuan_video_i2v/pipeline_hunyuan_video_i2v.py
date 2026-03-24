@@ -53,6 +53,7 @@ def _expand_input_ids_with_image_tokens(
     batch_indices, non_image_indices = torch.where(text_input_ids != image_token_index)
 
     max_expanded_length = max_sequence_length + (num_special_image_tokens.max() * (image_emb_len - 1))
+    max_expanded_length = max(max_expanded_length, image_emb_end + max_sequence_length - image_emb_start)
     new_token_positions = torch.cumsum((special_image_token_mask * (image_emb_len - 1) + 1), -1) - 1
     text_to_overwrite = new_token_positions[batch_indices, non_image_indices]
 
@@ -61,7 +62,7 @@ def _expand_input_ids_with_image_tokens(
         dtype=text_input_ids.dtype, device=text_input_ids.device,
     )
     expanded_input_ids[batch_indices, text_to_overwrite] = text_input_ids[batch_indices, non_image_indices]
-    expanded_input_ids[batch_indices, image_emb_start:image_emb_end] = image_token_index
+    expanded_input_ids[:, image_emb_start:image_emb_end] = image_token_index
 
     expanded_attention_mask = torch.zeros(
         (text_input_ids.shape[0], max_expanded_length),
@@ -283,6 +284,13 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             text_input_ids, prompt_attention_mask, max_seq,
             image_token_index, image_emb_len, image_emb_start, image_emb_end, pad_token_id,
         )
+
+        print(f"[DEBUG] prompt: {prompt}")
+        print(f"[DEBUG] text_input_ids shape: {text_input_ids.shape}")
+        print(f"[DEBUG] expanded input_ids shape: {expanded['input_ids'].shape}")
+        print(f"[DEBUG] num image tokens in expanded: {(expanded['input_ids'] == image_token_index).sum().item()}")
+        print(f"[DEBUG] pixel_values shape: {image_embeds.shape}")
+        print(f"[DEBUG] image_token_index: {image_token_index}, image_emb_len: {image_emb_len}")
 
         prompt_embeds = self.text_encoder(
             **expanded, pixel_values=image_embeds, output_hidden_states=True,
