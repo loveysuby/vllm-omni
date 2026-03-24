@@ -318,6 +318,8 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
         assistant_crop_start = last_double_return - 1 + image_emb_len - 4
         assistant_crop_end = last_double_return - 1 + image_emb_len
+        mask_assistant_crop_start = last_double_return - 4
+        mask_assistant_crop_end = last_double_return
 
         prompt_embed_list = []
         prompt_mask_list = []
@@ -330,8 +332,8 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 prompt_embeds[i, assistant_crop_end[i].item():],
             ]))
             prompt_mask_list.append(torch.cat([
-                expanded_attention_mask[i, text_crop_start:assistant_crop_start[i].item()],
-                expanded_attention_mask[i, assistant_crop_end[i].item():],
+                prompt_attention_mask[i, crop_start:mask_assistant_crop_start[i].item()],
+                prompt_attention_mask[i, mask_assistant_crop_end[i].item():],
             ]))
             image_embed_list.append(prompt_embeds[i, image_emb_start:image_emb_end])
             image_mask_list.append(
