@@ -96,14 +96,16 @@ def _retrieve_latents(
 
 
 def get_hunyuan_video_i2v_post_process_func(od_config: OmniDiffusionConfig):
-    vae_scale_factor_temporal = 4
+    # token_replace keeps first frame as input image, no need to crop
     video_processor = VideoProcessor(vae_scale_factor=8)
 
-    def post_process_func(output: DiffusionOutput) -> DiffusionOutput:
-        if output.output.dim() == 5:
-            output.output = output.output[:, :, vae_scale_factor_temporal:, :, :]
-            output.output = video_processor.postprocess_video(output.output, output_type="np")[0]
-        return output
+    def post_process_func(video: torch.Tensor, output_type: str = "pil"):
+        if output_type == "latent":
+            return video
+        result = video_processor.postprocess_video(video, output_type=output_type)
+        if isinstance(result, list) and result and isinstance(result[0], list):
+            result = result[0]
+        return result
 
     return post_process_func
 
