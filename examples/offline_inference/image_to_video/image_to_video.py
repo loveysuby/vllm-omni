@@ -9,6 +9,7 @@ Supports:
 - Wan2.2-TI2V-5B-Diffusers: Unified T2V+I2V model (dense 5B)
 - LTX2 image-to-video pipeline
 - HunyuanVideo-1.5 I2V: SigLIP + VAE dual image conditioning
+- HunyuanVideo-I2V: LLaVA + CLIP dual text encoding with token replacement
 
 Usage:
     # Wan I2V-A14B (MoE)
@@ -30,6 +31,12 @@ Usage:
     python image_to_video.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v \
         --image input.jpg --prompt "A cat playing with yarn" \
         --flow-shift 5.0 --guidance-scale 6.0
+
+    # HunyuanVideo-I2V (original, 13B)
+    python image_to_video.py --model hunyuanvideo-community/HunyuanVideo-I2V \
+        --image input.jpg --prompt "A cat playing with yarn" \
+        --height 320 --width 480 --num-frames 45 \
+        --guidance-scale 6.0 --flow-shift 7.0 --num-inference-steps 50
 """
 
 import argparse

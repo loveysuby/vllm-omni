@@ -55,6 +55,7 @@ th {
 |`DreamIDOmniPipeline`| DreamID-Omni | `XuGuo699/DreamID-Omni` |
 | `HunyuanVideo15Pipeline` | HunyuanVideo-1.5-T2V | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`, `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` |
 | `HunyuanVideo15ImageToVideoPipeline` | HunyuanVideo-1.5-I2V | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v`, `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_i2v` |
+| `HunyuanVideoImageToVideoPipeline` | HunyuanVideo-I2V | `hunyuanvideo-community/HunyuanVideo-I2V` |
 |`VoxtralTTSForConditionalGeneration` | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` |
 
 
