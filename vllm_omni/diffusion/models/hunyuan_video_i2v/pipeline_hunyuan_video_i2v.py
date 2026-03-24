@@ -297,19 +297,20 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         ).hidden_states[-(num_hidden_layers_to_skip + 1)]
         prompt_embeds = prompt_embeds.to(dtype=dtype)
 
+        expanded_attention_mask = expanded["attention_mask"]
+
         text_crop_start = crop_start - 1 + image_emb_len
         batch_indices, last_double_return = torch.where(text_input_ids == double_return_token_id)
 
         if last_double_return.shape[0] == 3:
-            last_double_return = torch.cat([last_double_return, torch.tensor([text_input_ids.shape[-1]])])
-            batch_indices = torch.cat([batch_indices, torch.tensor([0])])
+            seq_len = text_input_ids.shape[-1]
+            last_double_return = torch.cat([last_double_return, torch.tensor([seq_len], device=device)])
+            batch_indices = torch.cat([batch_indices, torch.tensor([0], device=device)])
 
         last_double_return = last_double_return.reshape(text_input_ids.shape[0], -1)[:, -1]
 
         assistant_crop_start = last_double_return - 1 + image_emb_len - 4
         assistant_crop_end = last_double_return - 1 + image_emb_len
-        attn_mask_crop_start = last_double_return - 4
-        attn_mask_crop_end = last_double_return
 
         prompt_embed_list = []
         prompt_mask_list = []
@@ -322,12 +323,12 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 prompt_embeds[i, assistant_crop_end[i].item():],
             ]))
             prompt_mask_list.append(torch.cat([
-                prompt_attention_mask[i, crop_start:attn_mask_crop_start[i].item()],
-                prompt_attention_mask[i, attn_mask_crop_end[i].item():],
+                expanded_attention_mask[i, text_crop_start:assistant_crop_start[i].item()],
+                expanded_attention_mask[i, assistant_crop_end[i].item():],
             ]))
             image_embed_list.append(prompt_embeds[i, image_emb_start:image_emb_end])
             image_mask_list.append(
-                torch.ones(image_emb_end - image_emb_start, device=device, dtype=prompt_attention_mask.dtype)
+                torch.ones(image_emb_end - image_emb_start, device=device, dtype=expanded_attention_mask.dtype)
             )
 
         prompt_embed_list = torch.stack(prompt_embed_list)
