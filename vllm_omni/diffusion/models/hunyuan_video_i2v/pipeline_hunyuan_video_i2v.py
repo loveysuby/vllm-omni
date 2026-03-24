@@ -11,6 +11,7 @@ from typing import Any, cast
 import numpy as np
 import PIL.Image
 import torch
+import torch.nn.functional as F
 from diffusers import AutoencoderKLHunyuanVideo
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
@@ -327,14 +328,22 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         image_mask_list = []
 
         for i in range(text_input_ids.shape[0]):
-            prompt_embed_list.append(torch.cat([
+            embed_part = torch.cat([
                 prompt_embeds[i, text_crop_start:assistant_crop_start[i].item()],
                 prompt_embeds[i, assistant_crop_end[i].item():],
-            ]))
-            prompt_mask_list.append(torch.cat([
+            ])
+            mask_part = torch.cat([
                 prompt_attention_mask[i, crop_start:mask_assistant_crop_start[i].item()],
                 prompt_attention_mask[i, mask_assistant_crop_end[i].item():],
-            ]))
+            ])
+            if mask_part.shape[0] != embed_part.shape[0]:
+                target_len = embed_part.shape[0]
+                if mask_part.shape[0] < target_len:
+                    mask_part = F.pad(mask_part, (0, target_len - mask_part.shape[0]), value=0)
+                else:
+                    mask_part = mask_part[:target_len]
+            prompt_embed_list.append(embed_part)
+            prompt_mask_list.append(mask_part)
             image_embed_list.append(prompt_embeds[i, image_emb_start:image_emb_end])
             image_mask_list.append(
                 torch.ones(image_emb_end - image_emb_start, device=device, dtype=expanded_attention_mask.dtype)
