@@ -166,14 +166,14 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             model, subfolder="tokenizer", local_files_only=local_files_only,
         )
         self.text_encoder = LlavaForConditionalGeneration.from_pretrained(
-            model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only,
+            model, subfolder="text_encoder", dtype=dtype, local_files_only=local_files_only,
         ).to(self.device)
 
         self.tokenizer_2 = CLIPTokenizer.from_pretrained(
             model, subfolder="tokenizer_2", local_files_only=local_files_only,
         )
         self.text_encoder_2 = CLIPTextModel.from_pretrained(
-            model, subfolder="text_encoder_2", torch_dtype=dtype, local_files_only=local_files_only,
+            model, subfolder="text_encoder_2", dtype=dtype, local_files_only=local_files_only,
         ).to(self.device)
 
         self.image_processor = CLIPImageProcessor.from_pretrained(
@@ -181,7 +181,7 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         )
 
         self.vae = AutoencoderKLHunyuanVideo.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only,
+            model, subfolder="vae", dtype=torch.float32, local_files_only=local_files_only,
         ).to(self.device)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
