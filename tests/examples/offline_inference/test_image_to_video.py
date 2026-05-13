@@ -3,6 +3,8 @@ Offline inference tests: image-to-video.
 See examples/offline_inference/image_to_video/README.md
 """
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -22,11 +24,26 @@ I2V_SCRIPT = EXAMPLES / "offline_inference" / "image_to_video" / "image_to_video
 README_PATH = I2V_SCRIPT.with_name("README.md")
 EXAMPLE_OUTPUT_SUBFOLDER = "example_offline_i2v"
 
+_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg"
+_IMAGE_NAME = "cherry_blossom.jpg"
+
 _SKIP_SECTIONS = {
     "Prerequisites",
     "Advanced Features",
     "FAQ",
 }
+
+
+def _ensure_test_image(run_dir: Path) -> None:
+    """Download or copy the example image into run_dir so CLI snippets can find it."""
+    dest = run_dir / _IMAGE_NAME
+    if dest.exists():
+        return
+    src = I2V_SCRIPT.parent / _IMAGE_NAME
+    if src.exists():
+        shutil.copy2(src, dest)
+    else:
+        subprocess.check_call(["wget", "-q", "-O", str(dest), _IMAGE_URL])
 
 
 def _skip_readme_snippet(language: str, code: str, h2_title: str) -> tuple[bool, str]:
@@ -47,6 +64,10 @@ def test_image_to_video(snippet: ReadmeSnippet, example_runner: ExampleRunner):
     should_skip, reason = snippet.skip
     if should_skip:
         pytest.skip(reason)
+
+    run_dir = example_runner.output_root / EXAMPLE_OUTPUT_SUBFOLDER / snippet.test_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_test_image(run_dir)
 
     result = example_runner.run(snippet, output_subfolder=Path(EXAMPLE_OUTPUT_SUBFOLDER))
     for asset in result.assets:
