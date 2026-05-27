@@ -252,16 +252,23 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             "<|start_header_id|>assistant<|end_header_id|>\n\n"
         )
         # fmt: on
-        self.prompt_template_crop_start = 103
         self.prompt_template_image_emb_start = 5
         self.prompt_template_image_emb_end = 581
         self.prompt_template_image_emb_len = 576
-        self.prompt_template_double_return_token_id = 271
         self.default_image_embed_interleave = 4
 
-        self._guidance_scale = None
-        self._num_timesteps = None
-        self._current_timestep = None
+        # Dynamically compute template parameters from the tokenizer
+        # to stay compatible across different transformers versions.
+        system_part = self.prompt_template.split("<|eot_id|>")[0] + "<|eot_id|>"
+        self.prompt_template_crop_start = len(
+            self.tokenizer.encode(system_part, add_special_tokens=True)
+        )
+
+        assistant_suffix = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        nn_suffix_len = len(self.tokenizer.encode("\n\n", add_special_tokens=False))
+        assistant_suffix_len = len(self.tokenizer.encode(assistant_suffix, add_special_tokens=False))
+        self._nn_suffix_len = nn_suffix_len
+        self._assistant_crop_count = assistant_suffix_len - nn_suffix_len
 
     @property
     def guidance_scale(self):
@@ -291,7 +298,6 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         image_emb_len = self.prompt_template_image_emb_len
         image_emb_start = self.prompt_template_image_emb_start
         image_emb_end = self.prompt_template_image_emb_end
-        double_return_token_id = self.prompt_template_double_return_token_id
         max_seq = max_sequence_length + crop_start
 
         text_inputs = self.tokenizer(
@@ -331,18 +337,14 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         expanded_attention_mask = expanded["attention_mask"]
 
         text_crop_start = crop_start - 1 + image_emb_len
-        batch_indices, last_double_return = torch.where(text_input_ids == double_return_token_id)
 
-        if last_double_return.shape[0] == 3:
-            seq_len = text_input_ids.shape[-1]
-            last_double_return = torch.cat([last_double_return, torch.tensor([seq_len], device=device)])
-            batch_indices = torch.cat([batch_indices, torch.tensor([0], device=device)])
+        pad_token_id = self.text_encoder.config.pad_token_id
+        non_pad_counts = (text_input_ids != pad_token_id).sum(dim=-1)
+        last_double_return = non_pad_counts - self._nn_suffix_len
 
-        last_double_return = last_double_return.reshape(text_input_ids.shape[0], -1)[:, -1]
-
-        assistant_crop_start = last_double_return - 1 + image_emb_len - 4
+        assistant_crop_start = last_double_return - 1 + image_emb_len - self._assistant_crop_count
         assistant_crop_end = last_double_return - 1 + image_emb_len
-        mask_assistant_crop_start = last_double_return - 4
+        mask_assistant_crop_start = last_double_return - self._assistant_crop_count
         mask_assistant_crop_end = last_double_return
 
         prompt_embed_list = []
