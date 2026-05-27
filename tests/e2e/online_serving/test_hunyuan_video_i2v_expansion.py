@@ -7,6 +7,7 @@ for HunyuanVideo-I2V (original, 13B dual-stream + single-stream).
 Coverage (H100, since model cannot fit L4):
 - CacheDiT + Layerwise CPU offloading (1 GPU)
 - CacheDiT + TP=2 + VAE patch parallel=2 (2 GPUs)
+- CFG parallel=2 with true CFG guidance (2 GPUs)
 """
 
 import pytest
@@ -63,6 +64,17 @@ def _get_diffusion_feature_cases(model: str):
             id="parallel_cachedit_tp2_vae2",
             marks=PARALLEL_MARKS,
         ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--cfg-parallel-size",
+                    "2",
+                ],
+            ),
+            id="parallel_cfg2_true_cfg",
+            marks=PARALLEL_MARKS,
+        ),
     ]
 
 
@@ -94,6 +106,7 @@ def test_hunyuan_video_i2v(
             "num_frames": 5,
             "num_inference_steps": 2,
             "guidance_scale": 6.0,
+            "true_cfg_scale": 6.0,
             "negative_prompt": NEGATIVE_PROMPT,
             "seed": 42,
         },
