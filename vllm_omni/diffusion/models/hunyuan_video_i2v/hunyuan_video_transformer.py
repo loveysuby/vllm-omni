@@ -87,9 +87,7 @@ class HunyuanVideoRotaryPosEmbed(nn.Module):
 
         freqs = []
         for i in range(3):
-            freq_cis = get_1d_rotary_pos_embed(
-                self.rope_dim[i], grid[i].reshape(-1), self.theta, use_real=False
-            )
+            freq_cis = get_1d_rotary_pos_embed(self.rope_dim[i], grid[i].reshape(-1), self.theta, use_real=False)
             freqs.append((freq_cis.real, freq_cis.imag))
 
         freqs_cos = torch.cat([f[0] for f in freqs], dim=1).float()
@@ -172,8 +170,8 @@ class HunyuanVideoTokenReplaceAdaLayerNormZero(nn.Module):
         token_replace_emb = self.linear(self.silu(token_replace_emb))
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
-        tr_shift_msa, tr_scale_msa, tr_gate_msa, tr_shift_mlp, tr_scale_mlp, tr_gate_mlp = (
-            token_replace_emb.chunk(6, dim=1)
+        tr_shift_msa, tr_scale_msa, tr_gate_msa, tr_shift_mlp, tr_scale_mlp, tr_gate_mlp = token_replace_emb.chunk(
+            6, dim=1
         )
 
         norm_hidden_states = self.norm(hidden_states)
@@ -187,8 +185,14 @@ class HunyuanVideoTokenReplaceAdaLayerNormZero(nn.Module):
 
         return (
             hidden_states,
-            gate_msa, shift_mlp, scale_mlp, gate_mlp,
-            tr_gate_msa, tr_shift_mlp, tr_scale_mlp, tr_gate_mlp,
+            gate_msa,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+            tr_gate_msa,
+            tr_shift_mlp,
+            tr_scale_mlp,
+            tr_gate_mlp,
         )
 
 
@@ -405,8 +409,11 @@ class HunyuanVideoDualAttention(nn.Module):
         self.to_out = nn.ModuleList(
             [
                 RowParallelLinear(
-                    self.inner_dim, self.out_dim, bias=out_bias,
-                    input_is_parallel=True, return_bias=False,
+                    self.inner_dim,
+                    self.out_dim,
+                    bias=out_bias,
+                    input_is_parallel=True,
+                    return_bias=False,
                 ),
                 nn.Identity(),
             ]
@@ -424,15 +431,18 @@ class HunyuanVideoDualAttention(nn.Module):
             )
 
             self.to_add_out = RowParallelLinear(
-                self.inner_dim, query_dim, bias=out_bias,
-                input_is_parallel=True, return_bias=False,
+                self.inner_dim,
+                query_dim,
+                bias=out_bias,
+                input_is_parallel=True,
+                return_bias=False,
             )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
             num_heads=self.to_qkv.num_heads,
             head_size=self.head_dim,
-            softmax_scale=1.0 / (self.head_dim ** 0.5),
+            softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
             num_kv_heads=self.to_qkv.num_kv_heads,
         )
@@ -482,9 +492,7 @@ class HunyuanVideoDualAttention(nn.Module):
         attn_metadata = None
         if attention_mask is not None:
             seq_len = query.shape[1]
-            attention_mask = F.pad(
-                attention_mask, (seq_len - attention_mask.shape[1], 0), value=True
-            ).bool()
+            attention_mask = F.pad(attention_mask, (seq_len - attention_mask.shape[1], 0), value=True).bool()
             attn_metadata = AttentionMetadata(attn_mask=attention_mask)
 
         hidden_states = self.attn(query, key, value, attn_metadata)
@@ -492,8 +500,8 @@ class HunyuanVideoDualAttention(nn.Module):
 
         if encoder_hidden_states is not None:
             hidden_states, encoder_hidden_states = hidden_states.split_with_sizes(
-                [hidden_states.shape[1] - encoder_hidden_states.shape[1],
-                 encoder_hidden_states.shape[1]], dim=1,
+                [hidden_states.shape[1] - encoder_hidden_states.shape[1], encoder_hidden_states.shape[1]],
+                dim=1,
             )
             hidden_states = self.to_out[0](hidden_states)
             encoder_hidden_states = self.to_add_out(encoder_hidden_states)
@@ -530,7 +538,7 @@ class HunyuanVideoSingleAttention(nn.Module):
         self.attn = Attention(
             num_heads=self.to_qkv.num_heads,
             head_size=self.head_dim,
-            softmax_scale=1.0 / (self.head_dim ** 0.5),
+            softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
             num_kv_heads=self.to_qkv.num_kv_heads,
         )
@@ -603,9 +611,7 @@ class HunyuanVideoTransformerBlock(nn.Module):
         freqs_cis: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         norm_hs, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
-        norm_enc, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
-            encoder_hidden_states, emb=temb
-        )
+        norm_enc, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(encoder_hidden_states, emb=temb)
 
         attn_out, ctx_attn_out = self.attn(
             hidden_states=norm_hs,
@@ -642,11 +648,17 @@ class HunyuanVideoSingleTransformerBlock(nn.Module):
 
         self.norm = AdaLayerNormZeroSingle(dim)
         self.proj_mlp = ReplicatedLinear(
-            dim, self.mlp_hidden_dim, bias=True, return_bias=False,
+            dim,
+            self.mlp_hidden_dim,
+            bias=True,
+            return_bias=False,
         )
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = ReplicatedLinear(
-            dim + self.mlp_hidden_dim, dim, bias=True, return_bias=False,
+            dim + self.mlp_hidden_dim,
+            dim,
+            bias=True,
+            return_bias=False,
         )
 
         self.attn = HunyuanVideoSingleAttention(
@@ -672,7 +684,9 @@ class HunyuanVideoSingleTransformerBlock(nn.Module):
         mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
 
         attn_output = self.attn(
-            norm_hidden_states, text_seq_len=text_seq_len, image_rotary_emb=image_rotary_emb,
+            norm_hidden_states,
+            text_seq_len=text_seq_len,
+            image_rotary_emb=image_rotary_emb,
         )
 
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
@@ -730,12 +744,16 @@ class HunyuanVideoTokenReplaceTransformerBlock(nn.Module):
 
         (
             norm_hs,
-            gate_msa, shift_mlp, scale_mlp, gate_mlp,
-            tr_gate_msa, tr_shift_mlp, tr_scale_mlp, tr_gate_mlp,
+            gate_msa,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+            tr_gate_msa,
+            tr_shift_mlp,
+            tr_scale_mlp,
+            tr_gate_mlp,
         ) = self.norm1(hidden_states, temb, token_replace_emb, n)
-        norm_enc, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
-            encoder_hidden_states, emb=temb
-        )
+        norm_enc, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(encoder_hidden_states, emb=temb)
 
         attn_out, ctx_attn_out = self.attn(
             hidden_states=norm_hs,
@@ -781,11 +799,17 @@ class HunyuanVideoTokenReplaceSingleTransformerBlock(nn.Module):
 
         self.norm = HunyuanVideoTokenReplaceAdaLayerNormZeroSingle(dim)
         self.proj_mlp = ReplicatedLinear(
-            dim, self.mlp_hidden_dim, bias=True, return_bias=False,
+            dim,
+            self.mlp_hidden_dim,
+            bias=True,
+            return_bias=False,
         )
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = ReplicatedLinear(
-            dim + self.mlp_hidden_dim, dim, bias=True, return_bias=False,
+            dim + self.mlp_hidden_dim,
+            dim,
+            bias=True,
+            return_bias=False,
         )
 
         self.attn = HunyuanVideoSingleAttention(
@@ -810,12 +834,18 @@ class HunyuanVideoTokenReplaceSingleTransformerBlock(nn.Module):
 
         residual = hidden_states
         norm_hidden_states, gate, tr_gate = self.norm(
-            hidden_states, temb, token_replace_emb, text_seq_len, first_frame_num_tokens,
+            hidden_states,
+            temb,
+            token_replace_emb,
+            text_seq_len,
+            first_frame_num_tokens,
         )
         mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
 
         attn_output = self.attn(
-            norm_hidden_states, text_seq_len=text_seq_len, image_rotary_emb=image_rotary_emb,
+            norm_hidden_states,
+            text_seq_len=text_seq_len,
+            image_rotary_emb=image_rotary_emb,
         )
 
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
@@ -893,10 +923,15 @@ class HunyuanVideoTransformer3DModel(nn.Module):
         self.guidance_embeds = guidance_embeds
 
         self.x_embedder = HunyuanVideoPatchEmbed(
-            (patch_size_t, patch_size, patch_size), in_channels, inner_dim,
+            (patch_size_t, patch_size, patch_size),
+            in_channels,
+            inner_dim,
         )
         self.context_embedder = HunyuanVideoTokenRefiner(
-            text_embed_dim, num_attention_heads, attention_head_dim, num_layers=num_refiner_layers,
+            text_embed_dim,
+            num_attention_heads,
+            attention_head_dim,
+            num_layers=num_refiner_layers,
         )
 
         if image_condition_type == "token_replace":
@@ -908,11 +943,13 @@ class HunyuanVideoTransformer3DModel(nn.Module):
             )
         elif guidance_embeds:
             self.time_text_embed = CombinedTimestepGuidanceTextProjEmbeddings(
-                embedding_dim=inner_dim, pooled_projection_dim=pooled_projection_dim,
+                embedding_dim=inner_dim,
+                pooled_projection_dim=pooled_projection_dim,
             )
         else:
             self.time_text_embed = CombinedTimestepTextProjEmbeddings(
-                embedding_dim=inner_dim, pooled_projection_dim=pooled_projection_dim,
+                embedding_dim=inner_dim,
+                pooled_projection_dim=pooled_projection_dim,
             )
 
         self.rope = HunyuanVideoRotaryPosEmbed(patch_size, patch_size_t, list(rope_axes_dim), rope_theta)
@@ -921,7 +958,10 @@ class HunyuanVideoTransformer3DModel(nn.Module):
             self.transformer_blocks = nn.ModuleList(
                 [
                     HunyuanVideoTokenReplaceTransformerBlock(
-                        num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, qk_norm=qk_norm,
+                        num_attention_heads,
+                        attention_head_dim,
+                        mlp_ratio=mlp_ratio,
+                        qk_norm=qk_norm,
                     )
                     for _ in range(num_layers)
                 ]
@@ -941,7 +981,10 @@ class HunyuanVideoTransformer3DModel(nn.Module):
             self.transformer_blocks = nn.ModuleList(
                 [
                     HunyuanVideoTransformerBlock(
-                        num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, qk_norm=qk_norm,
+                        num_attention_heads,
+                        attention_head_dim,
+                        mlp_ratio=mlp_ratio,
+                        qk_norm=qk_norm,
                     )
                     for _ in range(num_layers)
                 ]
@@ -993,39 +1036,62 @@ class HunyuanVideoTransformer3DModel(nn.Module):
 
         hidden_states = self.x_embedder(hidden_states)
         encoder_hidden_states = self.context_embedder(
-            encoder_hidden_states, timestep, encoder_attention_mask,
+            encoder_hidden_states,
+            timestep,
+            encoder_attention_mask,
         )
 
         if self.image_condition_type == "token_replace":
             for block in self.transformer_blocks:
                 hidden_states, encoder_hidden_states = block(
-                    hidden_states, encoder_hidden_states, temb,
-                    encoder_attention_mask, image_rotary_emb,
-                    token_replace_emb, first_frame_num_tokens,
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    encoder_attention_mask,
+                    image_rotary_emb,
+                    token_replace_emb,
+                    first_frame_num_tokens,
                 )
 
             for block in self.single_transformer_blocks:
                 hidden_states, encoder_hidden_states = block(
-                    hidden_states, encoder_hidden_states, temb, image_rotary_emb,
-                    token_replace_emb, first_frame_num_tokens,
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    image_rotary_emb,
+                    token_replace_emb,
+                    first_frame_num_tokens,
                 )
         else:
             for block in self.transformer_blocks:
                 hidden_states, encoder_hidden_states = block(
-                    hidden_states, encoder_hidden_states, temb,
-                    encoder_attention_mask, image_rotary_emb,
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    encoder_attention_mask,
+                    image_rotary_emb,
                 )
 
             for block in self.single_transformer_blocks:
                 hidden_states, encoder_hidden_states = block(
-                    hidden_states, encoder_hidden_states, temb, image_rotary_emb,
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    image_rotary_emb,
                 )
 
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(
-            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, -1, p_t, p_h, p_w,
+            batch_size,
+            post_patch_num_frames,
+            post_patch_height,
+            post_patch_width,
+            -1,
+            p_t,
+            p_h,
+            p_w,
         )
         hidden_states = hidden_states.permute(0, 4, 1, 5, 2, 6, 3, 7)
         hidden_states = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)

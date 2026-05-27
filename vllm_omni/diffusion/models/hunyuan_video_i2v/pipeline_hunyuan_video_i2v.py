@@ -59,15 +59,18 @@ def _expand_input_ids_with_image_tokens(
     text_to_overwrite = new_token_positions[batch_indices, non_image_indices]
 
     expanded_input_ids = torch.full(
-        (text_input_ids.shape[0], max_expanded_length), pad_token_id,
-        dtype=text_input_ids.dtype, device=text_input_ids.device,
+        (text_input_ids.shape[0], max_expanded_length),
+        pad_token_id,
+        dtype=text_input_ids.dtype,
+        device=text_input_ids.device,
     )
     expanded_input_ids[batch_indices, text_to_overwrite] = text_input_ids[batch_indices, non_image_indices]
     expanded_input_ids[:, image_emb_start:image_emb_end] = image_token_index
 
     expanded_attention_mask = torch.zeros(
         (text_input_ids.shape[0], max_expanded_length),
-        dtype=prompt_attention_mask.dtype, device=prompt_attention_mask.device,
+        dtype=prompt_attention_mask.dtype,
+        device=prompt_attention_mask.device,
     )
     attn_batch_indices, attention_indices = torch.where(expanded_input_ids != pad_token_id)
     expanded_attention_mask[attn_batch_indices, attention_indices] = 1.0
@@ -166,35 +169,53 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         local_files_only = os.path.exists(model)
 
         self.tokenizer = LlamaTokenizerFast.from_pretrained(
-            model, subfolder="tokenizer", local_files_only=local_files_only,
+            model,
+            subfolder="tokenizer",
+            local_files_only=local_files_only,
         )
         self.text_encoder = LlavaForConditionalGeneration.from_pretrained(
-            model, subfolder="text_encoder", dtype=dtype, local_files_only=local_files_only,
+            model,
+            subfolder="text_encoder",
+            dtype=dtype,
+            local_files_only=local_files_only,
         ).to(self.device)
 
         self.tokenizer_2 = CLIPTokenizer.from_pretrained(
-            model, subfolder="tokenizer_2", local_files_only=local_files_only,
+            model,
+            subfolder="tokenizer_2",
+            local_files_only=local_files_only,
         )
         self.text_encoder_2 = CLIPTextModel.from_pretrained(
-            model, subfolder="text_encoder_2", dtype=dtype, local_files_only=local_files_only,
+            model,
+            subfolder="text_encoder_2",
+            dtype=dtype,
+            local_files_only=local_files_only,
         ).to(self.device)
 
         self.image_processor = CLIPImageProcessor.from_pretrained(
-            model, subfolder="image_processor", local_files_only=local_files_only,
+            model,
+            subfolder="image_processor",
+            local_files_only=local_files_only,
         )
 
         self.vae = AutoencoderKLHunyuanVideo.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only,
+            model,
+            subfolder="vae",
+            torch_dtype=torch.float32,
+            local_files_only=local_files_only,
         ).to(self.device)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only,
+            model,
+            subfolder="scheduler",
+            local_files_only=local_files_only,
         )
         if od_config.flow_shift is not None:
             self.scheduler._shift = od_config.flow_shift
 
         transformer_kwargs = get_transformer_config_kwargs(
-            od_config.tf_model_config, HunyuanVideoTransformer3DModel,
+            od_config.tf_model_config,
+            HunyuanVideoTransformer3DModel,
         )
         self.transformer = HunyuanVideoTransformer3DModel(od_config=od_config, **transformer_kwargs)
 
@@ -274,8 +295,12 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         max_seq = max_sequence_length + crop_start
 
         text_inputs = self.tokenizer(
-            prompt, max_length=max_seq, padding="max_length", truncation=True,
-            return_tensors="pt", return_attention_mask=True,
+            prompt,
+            max_length=max_seq,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+            return_attention_mask=True,
         )
         text_input_ids = text_inputs.input_ids.to(device)
         prompt_attention_mask = text_inputs.attention_mask.to(device)
@@ -286,12 +311,20 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         pad_token_id = self.text_encoder.config.pad_token_id
 
         expanded = _expand_input_ids_with_image_tokens(
-            text_input_ids, prompt_attention_mask, max_seq,
-            image_token_index, image_emb_len, image_emb_start, image_emb_end, pad_token_id,
+            text_input_ids,
+            prompt_attention_mask,
+            max_seq,
+            image_token_index,
+            image_emb_len,
+            image_emb_start,
+            image_emb_end,
+            pad_token_id,
         )
 
         prompt_embeds = self.text_encoder(
-            **expanded, pixel_values=image_embeds, output_hidden_states=True,
+            **expanded,
+            pixel_values=image_embeds,
+            output_hidden_states=True,
         ).hidden_states[-(num_hidden_layers_to_skip + 1)]
         prompt_embeds = prompt_embeds.to(dtype=dtype)
 
@@ -318,14 +351,18 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         image_mask_list = []
 
         for i in range(text_input_ids.shape[0]):
-            embed_part = torch.cat([
-                prompt_embeds[i, text_crop_start:assistant_crop_start[i].item()],
-                prompt_embeds[i, assistant_crop_end[i].item():],
-            ])
-            mask_part = torch.cat([
-                prompt_attention_mask[i, crop_start:mask_assistant_crop_start[i].item()],
-                prompt_attention_mask[i, mask_assistant_crop_end[i].item():],
-            ])
+            embed_part = torch.cat(
+                [
+                    prompt_embeds[i, text_crop_start : assistant_crop_start[i].item()],
+                    prompt_embeds[i, assistant_crop_end[i].item() :],
+                ]
+            )
+            mask_part = torch.cat(
+                [
+                    prompt_attention_mask[i, crop_start : mask_assistant_crop_start[i].item()],
+                    prompt_attention_mask[i, mask_assistant_crop_end[i].item() :],
+                ]
+            )
             if mask_part.shape[0] != embed_part.shape[0]:
                 target_len = embed_part.shape[0]
                 if mask_part.shape[0] < target_len:
@@ -362,8 +399,11 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         max_sequence_length: int = 77,
     ) -> torch.Tensor:
         text_inputs = self.tokenizer_2(
-            prompt, padding="max_length", max_length=max_sequence_length,
-            truncation=True, return_tensors="pt",
+            prompt,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_tensors="pt",
         )
         pooled = self.text_encoder_2(text_inputs.input_ids.to(device), output_hidden_states=False).pooler_output
         return pooled.to(dtype=dtype)
@@ -381,7 +421,10 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         interleave = image_embed_interleave or self.default_image_embed_interleave
 
         prompt_embeds, prompt_attention_mask = self._get_llama_prompt_embeds(
-            image, prompt, device, dtype,
+            image,
+            prompt,
+            device,
+            dtype,
             max_sequence_length=max_sequence_length,
             image_embed_interleave=interleave,
         )
@@ -458,9 +501,7 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             raw_image = raw_image[0]
 
         if raw_image is None:
-            raise ValueError(
-                "Image is required for HunyuanVideo I2V. Pass via multi_modal_data={'image': <image>}"
-            )
+            raise ValueError("Image is required for HunyuanVideo I2V. Pass via multi_modal_data={'image': <image>}")
 
         if isinstance(raw_image, str):
             image = PIL.Image.open(raw_image).convert("RGB")
@@ -491,7 +532,10 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
         prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = self.encode_prompt(
-            image=image, prompt=prompt, device=device, dtype=dtype,
+            image=image,
+            prompt=prompt,
+            device=device,
+            dtype=dtype,
         )
         prompt_embeds = prompt_embeds.to(dtype)
         prompt_attention_mask = prompt_attention_mask.to(dtype)
@@ -504,17 +548,25 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         negative_prompt_attention_mask = None
         if do_true_cfg:
             black_image = PIL.Image.new("RGB", (width, height), 0)
-            negative_prompt_embeds, negative_pooled_prompt_embeds, negative_prompt_attention_mask = (
-                self.encode_prompt(
-                    image=black_image, prompt=negative_prompt, device=device, dtype=dtype,
-                )
+            negative_prompt_embeds, negative_pooled_prompt_embeds, negative_prompt_attention_mask = self.encode_prompt(
+                image=black_image,
+                prompt=negative_prompt,
+                device=device,
+                dtype=dtype,
             )
             negative_prompt_embeds = negative_prompt_embeds.to(dtype)
             negative_prompt_attention_mask = negative_prompt_attention_mask.to(dtype)
             negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(dtype)
 
         latents, image_latents = self.prepare_latents(
-            image, batch_size, height, width, num_frames_val, dtype, device, generator,
+            image,
+            batch_size,
+            height,
+            width,
+            num_frames_val,
+            dtype,
+            device,
+            generator,
             req.sampling_params.latents,
         )
 
@@ -525,9 +577,14 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
         guidance = None
         if self.transformer.guidance_embeds:
-            guidance = torch.tensor(
-                [guidance_scale] * batch_size, dtype=dtype, device=device,
-            ) * 1000.0
+            guidance = (
+                torch.tensor(
+                    [guidance_scale] * batch_size,
+                    dtype=dtype,
+                    device=device,
+                )
+                * 1000.0
+            )
 
         for i, t in enumerate(timesteps):
             self._current_timestep = t
