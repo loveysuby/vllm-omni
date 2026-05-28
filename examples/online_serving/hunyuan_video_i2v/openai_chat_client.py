@@ -25,6 +25,7 @@ def create_video_job(args: argparse.Namespace) -> str:
             "guidance_scale": str(args.guidance_scale),
             "true_cfg_scale": str(args.true_cfg_scale),
             "seed": str(args.seed),
+            "vae_use_tiling": str(args.vae_use_tiling).lower(),
         }
         if args.negative_prompt:
             data["negative_prompt"] = args.negative_prompt
@@ -81,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance-scale", type=float, default=6.0)
     parser.add_argument("--true-cfg-scale", type=float, default=6.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--vae-use-tiling", action="store_true", default=False,
+                        help="Enable VAE tiling to reduce peak VRAM (recommended for GPUs with <80GB VRAM)")
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--output", default="hunyuan_i2v_online.mp4")
