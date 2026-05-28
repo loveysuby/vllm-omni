@@ -260,9 +260,7 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         # Dynamically compute template parameters from the tokenizer
         # to stay compatible across different transformers versions.
         system_part = self.prompt_template.split("<|eot_id|>")[0] + "<|eot_id|>"
-        self.prompt_template_crop_start = len(
-            self.tokenizer.encode(system_part, add_special_tokens=True)
-        )
+        self.prompt_template_crop_start = len(self.tokenizer.encode(system_part, add_special_tokens=True))
 
         assistant_suffix = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         nn_suffix_len = len(self.tokenizer.encode("\n\n", add_special_tokens=False))
