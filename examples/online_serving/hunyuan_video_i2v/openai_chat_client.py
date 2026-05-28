@@ -82,8 +82,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance-scale", type=float, default=6.0)
     parser.add_argument("--true-cfg-scale", type=float, default=6.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--vae-use-tiling", action="store_true", default=False,
-                        help="Enable VAE tiling to reduce peak VRAM (recommended for GPUs with <80GB VRAM)")
+    parser.add_argument(
+        "--vae-use-tiling",
+        action="store_true",
+        default=False,
+        help="Enable VAE tiling to reduce peak VRAM (recommended for GPUs with <80GB VRAM)",
+    )
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--output", default="hunyuan_i2v_online.mp4")
