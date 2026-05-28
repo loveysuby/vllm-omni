@@ -870,8 +870,10 @@ class HunyuanVideoTransformer3DModel(nn.Module):
     _repeated_blocks = [
         "HunyuanVideoTransformerBlock",
         "HunyuanVideoSingleTransformerBlock",
-        "HunyuanVideoTokenReplaceTransformerBlock",
-        "HunyuanVideoTokenReplaceSingleTransformerBlock",
+        # TokenReplace blocks use dynamic slicing ([:, :n], [:, n:]) with
+        # torch.cat that triggers a PyTorch inductor KeyError in the
+        # dependency-graph scheduler.  Run them in eager mode until the
+        # inductor bug is resolved.
     ]
     _layerwise_offload_blocks_attr = "transformer_blocks"
     packed_modules_mapping = {
