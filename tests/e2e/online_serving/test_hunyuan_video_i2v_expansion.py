@@ -65,7 +65,10 @@ def _get_diffusion_feature_cases(model: str):
             # TP=2 is not yet functional for the single-stream blocks (sharded
             # attention output vs replicated MLP projection width mismatch).
             # Skip until fixed; see PR known limitations.
-            marks=[*PARALLEL_MARKS, pytest.mark.skip(reason="TP=2 not yet supported for HunyuanVideo-I2V single-stream blocks")],
+            marks=[
+                *PARALLEL_MARKS,
+                pytest.mark.skip(reason="TP=2 not yet supported for HunyuanVideo-I2V single-stream blocks"),
+            ],
         ),
         pytest.param(
             OmniServerParams(
