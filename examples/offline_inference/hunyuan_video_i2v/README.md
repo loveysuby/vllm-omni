@@ -16,7 +16,7 @@ python end2end.py \
   --num-frames 45 \
   --num-inference-steps 50 \
   --guidance-scale 6.0 \
-  --true-cfg-scale 6.0 \
+  --true-cfg-scale 1.0 \
   --flow-shift 7.0 \
   --seed 42 \
   --output hunyuan_i2v_output.mp4

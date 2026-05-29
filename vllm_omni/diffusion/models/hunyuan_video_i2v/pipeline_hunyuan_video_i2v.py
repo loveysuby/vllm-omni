@@ -99,6 +99,40 @@ def _retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
+def _resolve_last_token_positions(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    token_id: int,
+) -> torch.Tensor:
+    """Return, per row, the index of the last occurrence of ``token_id``.
+
+    When a row contains no ``token_id`` (e.g. the tokenizer split ``\\n\\n`` into
+    a different number of tokens across transformers versions), fall back to the
+    last non-pad position derived from ``attention_mask``. This keeps the prompt
+    crop boundary stable instead of relying on a hard-coded token id.
+
+    Args:
+        input_ids: ``[batch, seq_len]`` token ids.
+        attention_mask: ``[batch, seq_len]`` mask (non-zero = real token).
+        token_id: token id to search for.
+
+    Returns:
+        ``[batch]`` LongTensor of resolved positions.
+    """
+    seq_len = input_ids.shape[-1]
+    positions = torch.arange(seq_len, device=input_ids.device)
+
+    matches = input_ids == token_id
+    masked_positions = torch.where(matches, positions.expand_as(input_ids), torch.full_like(input_ids, -1))
+    last_match = masked_positions.max(dim=-1).values
+
+    last_non_pad = (attention_mask != 0).sum(dim=-1).long() - 1
+    last_non_pad = last_non_pad.clamp(min=0)
+
+    has_match = matches.any(dim=-1)
+    return torch.where(has_match, last_match.long(), last_non_pad)
+
+
 def get_hunyuan_video_i2v_post_process_func(od_config: OmniDiffusionConfig):
     # token_replace keeps first frame as input image, no need to crop
     video_processor = VideoProcessor(vae_scale_factor=8)
@@ -265,7 +299,6 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         assistant_suffix = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         nn_suffix_len = len(self.tokenizer.encode("\n\n", add_special_tokens=False))
         assistant_suffix_len = len(self.tokenizer.encode(assistant_suffix, add_special_tokens=False))
-        self._nn_suffix_len = nn_suffix_len
         self._assistant_crop_count = assistant_suffix_len - nn_suffix_len
 
     @property
@@ -336,9 +369,15 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
         text_crop_start = crop_start - 1 + image_emb_len
 
-        pad_token_id = self.text_encoder.config.pad_token_id
-        non_pad_counts = (text_input_ids != pad_token_id).sum(dim=-1)
-        last_double_return = non_pad_counts - self._nn_suffix_len
+        # Anchor the assistant boundary on the stable "<|end_header_id|>" special
+        # token instead of counting tokens from the end. The trailing "\n\n" starts
+        # right after the last "<|end_header_id|>", so this equals the previous
+        # (non_pad_count - nn_suffix_len) computation while staying robust to "\n\n"
+        # tokenizing into a different number of tokens across transformers versions.
+        end_header_token_id = self.tokenizer.convert_tokens_to_ids("<|end_header_id|>")
+        last_double_return = (
+            _resolve_last_token_positions(text_input_ids, prompt_attention_mask, end_header_token_id) + 1
+        )
 
         assistant_crop_start = last_double_return - 1 + image_emb_len - self._assistant_crop_count
         assistant_crop_end = last_double_return - 1 + image_emb_len
@@ -472,6 +511,79 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
     def predict_noise(self, **kwargs: Any) -> torch.Tensor:
         return self.transformer(**kwargs)[0]
 
+    def diffuse(
+        self,
+        latents: torch.Tensor,
+        image_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_prompt_attention_mask: torch.Tensor | None,
+        negative_pooled_prompt_embeds: torch.Tensor | None,
+        guidance: torch.Tensor | None,
+        do_true_cfg: bool,
+        true_cfg_scale: float,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Denoising loop routed through the CFGParallelMixin standard path.
+
+        ``predict_noise_maybe_with_cfg`` / ``scheduler_step_maybe_with_cfg``
+        let cfg_parallel_size > 1 dispatch the positive/negative branches across
+        ranks and all-gather the result. ``cfg_normalize=False`` reproduces the
+        plain ``neg + scale * (pos - neg)`` formula HunyuanVideo-I2V expects.
+
+        token_replace I2V keeps the first latent frame pinned to the input image,
+        so only frames ``[1:]`` are stepped and ``image_latents`` is re-prepended
+        each step.
+        """
+        for _, t in enumerate(timesteps):
+            self._current_timestep = t
+            timestep = t.expand(latents.shape[0]).to(latents.dtype)
+
+            latent_model_input = torch.cat([image_latents, latents[:, :, 1:]], dim=2).to(dtype)
+
+            positive_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": timestep,
+                "encoder_hidden_states": prompt_embeds,
+                "encoder_attention_mask": prompt_attention_mask,
+                "pooled_projections": pooled_prompt_embeds,
+                "guidance": guidance,
+                "return_dict": False,
+            }
+            negative_kwargs = None
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "encoder_attention_mask": negative_prompt_attention_mask,
+                    "pooled_projections": negative_pooled_prompt_embeds,
+                    "guidance": guidance,
+                    "return_dict": False,
+                }
+
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=true_cfg_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+            )
+
+            denoised = self.scheduler_step_maybe_with_cfg(
+                noise_pred[:, :, 1:],
+                t,
+                latents[:, :, 1:],
+                do_true_cfg,
+            )
+            latents = torch.cat([image_latents, denoised], dim=2)
+
+        self._current_timestep = None
+        return latents
+
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -586,38 +698,21 @@ class HunyuanVideoI2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
                 * 1000.0
             )
 
-        for i, t in enumerate(timesteps):
-            self._current_timestep = t
-            timestep = t.expand(latents.shape[0]).to(latents.dtype)
-
-            latent_model_input = torch.cat([image_latents, latents[:, :, 1:]], dim=2).to(dtype)
-
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
-                encoder_attention_mask=prompt_attention_mask,
-                pooled_projections=pooled_prompt_embeds,
-                guidance=guidance,
-                return_dict=False,
-            )[0]
-
-            if do_true_cfg and negative_prompt_embeds is not None:
-                neg_noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    encoder_attention_mask=negative_prompt_attention_mask,
-                    pooled_projections=negative_pooled_prompt_embeds,
-                    guidance=guidance,
-                    return_dict=False,
-                )[0]
-                noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
-
-            denoised = self.scheduler.step(noise_pred[:, :, 1:], t, latents[:, :, 1:], return_dict=False)[0]
-            latents = torch.cat([image_latents, denoised], dim=2)
-
-        self._current_timestep = None
+        latents = self.diffuse(
+            latents=latents,
+            image_latents=image_latents,
+            timesteps=timesteps,
+            prompt_embeds=prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            guidance=guidance,
+            do_true_cfg=do_true_cfg,
+            true_cfg_scale=true_cfg_scale,
+            dtype=dtype,
+        )
 
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()

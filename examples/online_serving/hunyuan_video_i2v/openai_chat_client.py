@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=45)
     parser.add_argument("--num-inference-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=6.0)
-    parser.add_argument("--true-cfg-scale", type=float, default=6.0)
+    parser.add_argument("--true-cfg-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--vae-use-tiling",
