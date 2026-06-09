@@ -87,6 +87,15 @@ def parse_args() -> argparse.Namespace:
         "--guidance-scale-high", type=float, default=None, help="Optional separate CFG for high-noise (MoE only)."
     )
     parser.add_argument(
+        "--true-cfg-scale",
+        type=float,
+        default=None,
+        help=(
+            "Real classifier-free guidance scale (HunyuanVideo-I2V). Unset or 1.0 uses distilled guidance only "
+            "(recommended for this guidance-distilled model); > 1 enables true CFG with a negative prompt."
+        ),
+    )
+    parser.add_argument(
         "--height", type=int, default=None, help="Video height (auto-calculated from image if not set)."
     )
     parser.add_argument("--width", type=int, default=None, help="Video width (auto-calculated from image if not set).")
@@ -402,6 +411,7 @@ def main():
             generator=generator,
             guidance_scale=guidance_scale,
             guidance_scale_2=args.guidance_scale_high,
+            true_cfg_scale=args.true_cfg_scale,
             boundary_ratio=args.boundary_ratio,
             num_inference_steps=num_inference_steps,
             num_frames=num_frames,
