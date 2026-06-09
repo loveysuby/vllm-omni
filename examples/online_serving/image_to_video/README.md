@@ -43,6 +43,24 @@ vllm serve /path/to/Wan2.2-I2V-A14B-LightX2V-Diffusers-Lightning \
   --seed 42
 ```
 
+### HunyuanVideo-I2V (original, 13B)
+
+Serve `hunyuanvideo-community/HunyuanVideo-I2V` and send requests with `true_cfg_scale=1.0`
+(distilled guidance only — this is a guidance-distilled model):
+
+```bash
+# server
+bash run_server_hunyuan_video_i2v.sh
+# overrides: MODEL, MODEL_CLASS_NAME, PORT (default 8099), FLOW_SHIFT (default 7.0),
+#            CACHE_BACKEND, ENABLE_CPU_OFFLOAD
+
+# client (async /v1/videos job, polls until complete)
+INPUT_IMAGE=./input.png bash run_curl_hunyuan_video_i2v.sh
+```
+
+For larger resolutions / longer clips, shard the weights across GPUs by adding
+`--use-hsdp --hsdp-shard-size 2` to the server command.
+
 ## Async Job Behavior
 
 `POST /v1/videos` is asynchronous. It creates a video job and immediately

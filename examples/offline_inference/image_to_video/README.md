@@ -48,6 +48,33 @@ python image_to_video.py \
   --output i2v_output.mp4
 ```
 
+### HunyuanVideo-I2V (original, 13B)
+
+`hunyuanvideo-community/HunyuanVideo-I2V` is a guidance-distilled image-to-video model, so the
+recommended setting is `--true-cfg-scale 1.0` (distilled guidance only). Stacking real CFG on top
+(`--true-cfg-scale` > 1 together with a high `--guidance-scale`) over-guides the model and produces
+over-saturated, flickering frames.
+
+```bash
+python image_to_video.py \
+  --model hunyuanvideo-community/HunyuanVideo-I2V \
+  --model-class-name HunyuanVideoImageToVideoPipeline \
+  --image cherry_blossom.jpg \
+  --prompt "Cinematic slow push-in on a curious rabbit in a sunny meadow, smooth camera motion" \
+  --height 480 \
+  --width 832 \
+  --num-frames 97 \
+  --num-inference-steps 50 \
+  --guidance-scale 6.0 \
+  --true-cfg-scale 1.0 \
+  --flow-shift 7.0 \
+  --seed 42 \
+  --output i2v_output.mp4
+```
+
+For larger resolutions / longer clips, shard the weights across GPUs with HSDP
+(`--use-hsdp --hsdp-shard-size 2`) and enable `--vae-use-tiling`.
+
 Key arguments:
 
 - `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V).
@@ -56,6 +83,7 @@ Key arguments:
 - `--height/--width`: Output resolution (auto-calculated from image if not set). Dimensions should be multiples of 16.
 - `--num-frames`: Number of frames (default 81).
 - `--guidance-scale` and `--guidance-scale-high`: CFG scale (applied to low/high-noise stages for MoE).
+- `--true-cfg-scale`: Real CFG scale for HunyuanVideo-I2V. Unset or `1.0` uses distilled guidance only (recommended); `> 1` enables true CFG with a negative prompt.
 - `--negative-prompt`: Optional list of artifacts to suppress.
 - `--boundary-ratio`: Boundary split ratio for two-stage MoE models.
 - `--flow-shift`: Scheduler flow shift (5.0 for 720p, 12.0 for 480p).
