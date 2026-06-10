@@ -37,7 +37,7 @@ Default model: `Wan-AI/Wan2.2-I2V-A14B-Diffusers`
 Download the example image used in the snippets below:
 
 ```bash
-wget https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg
+curl -L -o cherry_blossom.jpg https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg
 ```
 
 ## Quick Start
