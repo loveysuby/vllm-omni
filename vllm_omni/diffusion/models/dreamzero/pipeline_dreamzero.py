@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re as re_module
+import time
 from collections import OrderedDict
 from collections.abc import Iterable
 
@@ -57,6 +58,48 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
+
+
+# ---------------------------------------------------------------------------
+# [WIP] DreamZero host-side profiling (opt-in, output-neutral)
+# Enabled with env DREAMZERO_PROFILE_HOST=1. When disabled,
+# every helper below is a no-op: _hostprof_tic() returns None.
+# _hostprof_toc()/_hostprof_log() short-circuit, and no NVTX range is pushed.
+# So model outputs are unchanged and the added per-call cost is a few attribute lookups.
+# NVTX ranges are emitted only when CUDA is available so the same code path is safe on CPU-only dev machines.
+# ---------------------------------------------------------------------------
+
+_HOSTPROF_ENABLED = os.environ.get("DREAMZERO_PROFILE_HOST", "0") == "1"
+_HOSTPROF_NVTX = _HOSTPROF_ENABLED and torch.cuda.is_available()
+
+
+def _hostprof_tic() -> float | None:
+    return time.perf_counter() if _HOSTPROF_ENABLED else None
+
+
+def _hostprof_toc(label: str, t0: float | None, timings: dict[str, float]) -> None:
+    if t0 is not None:
+        timings[label] = timings.get(label, 0.0) + (time.perf_counter() - t0) * 1e3
+
+
+def _hostprof_push(label: str) -> None:
+    if _HOSTPROF_NVTX:
+        torch.cuda.nvtx.range_push(label)
+
+
+def _hostprof_pop() -> None:
+    if _HOSTPROF_NVTX:
+        torch.cuda.nvtx.range_pop()
+
+
+def _hostprof_log(timings: dict[str, float]) -> None:
+    if _HOSTPROF_ENABLED and timings:
+        breakdown = " ".join(f"{k}={v:.3f}ms" for k, v in timings.items())
+        logger.info("[hostprof] %s", breakdown)
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 
 class VideoActionScheduler:
@@ -920,7 +963,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         session_id = str(extra_args.get("session_id") or "default")
         state = self._get_or_create_state(session_id)
         self.state = state
+        host_timings: dict[str, float] = {}
+        _hostprof_push("transform")
+        _hostprof_t = _hostprof_tic()
         transform, unified_obs = self._transform_robot_obs(robot_obs)
+        _hostprof_toc("transform", _hostprof_t, host_timings)
+        _hostprof_pop()
         device = get_local_device()
 
         # ---- Step 1: Extract inputs from unified observation ----
@@ -961,6 +1009,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             state_features = None
 
         # ---- Step 1b: Tokenize ---- (wan2_2 convention: pipeline owns tokenizer)
+        _hostprof_push("tokenize_pos")
+        _hostprof_t = _hostprof_tic()
         text_inputs = self.tokenizer(
             prompt_str,
             max_length=512,
@@ -971,13 +1021,22 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
         text_tokens = text_inputs["input_ids"].to(device)
         attention_mask = text_inputs["attention_mask"].to(device)
+        _hostprof_toc("tokenize_pos", _hostprof_t, host_timings)
+        _hostprof_pop()
 
         # Explicit reset from OpenPI serving is carried by `extra_args["reset"]`
         # on the next inference request after websocket reset/session switch.
         if extra_args.get("reset", False):
             state.reset()
         else:
+            # Auto-reset based on model state (before accumulation).
+            # main(#4213) replaced should_reset(bool) with reset_reason
+            # (session / inference); keep that semantics, just time the call.
+            _hostprof_push("reset_reason")
+            _hostprof_t = _hostprof_tic()
             reset_reason = state.reset_reason(text_tokens, 0, self.transformer.local_attn_size)
+            _hostprof_toc("reset_reason", _hostprof_t, host_timings)
+            _hostprof_pop()
             if reset_reason == "session":
                 state.reset()
             elif reset_reason == "inference":
@@ -991,10 +1050,16 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         videos = self._preprocess_video(videos)  # → [B,C,T,H,W] bf16
         _, _, num_frames_raw, height, width = videos.shape
 
+        _hostprof_push("encode_text_pos")
+        _hostprof_t = _hostprof_tic()
         prompt_embeds = self._encode_text(text_tokens, attention_mask)
+        _hostprof_toc("encode_text_pos", _hostprof_t, host_timings)
+        _hostprof_pop()
         # Negative prompt for CFG uncond branch (model constant)
         negative_prompt_embeds = None
         if self.cfg_scale > 1.0:
+            _hostprof_push("neg_embed")
+            _hostprof_t = _hostprof_tic()
             neg_inputs = self.tokenizer(
                 self.negative_prompt,
                 max_length=512,
@@ -1007,6 +1072,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 neg_inputs["input_ids"].to(device),
                 neg_inputs["attention_mask"].to(device),
             )
+            _hostprof_toc("neg_embed", _hostprof_t, host_timings)
+            _hostprof_pop()
 
         # Extract first/last frame for CLIP + VAE encoding
         if num_frames_raw == 4 or num_frames_raw == 9:
@@ -1072,6 +1139,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         noise_obs = noise_obs.transpose(1, 2)
 
         do_true_cfg = self.cfg_scale > 1.0 and negative_prompt_embeds is not None
+        _hostprof_push("prefill_kv")
+        _hostprof_t = _hostprof_tic()
         self._prefill_kv_cache(
             image,
             prompt_embeds,
@@ -1081,9 +1150,15 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             do_true_cfg,
             state,
         )
+        _hostprof_toc("prefill_kv", _hostprof_t, host_timings)
+        _hostprof_pop()
 
+        _hostprof_push("sched_deepcopy")
+        _hostprof_t = _hostprof_tic()
         sample_scheduler = copy.deepcopy(self.scheduler)
         sample_scheduler_action = copy.deepcopy(self.scheduler)
+        _hostprof_toc("sched_deepcopy", _hostprof_t, host_timings)
+        _hostprof_pop()
         sample_scheduler.set_timesteps(
             self.num_inference_steps,
             device=device,
@@ -1108,6 +1183,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             sample_scheduler_action,
         )
 
+        _hostprof_push("diffuse")
+        _hostprof_t = _hostprof_tic()
         video_out, action_out = self.diffuse(
             video_latents=noise_obs,
             action_latents=noise_action,
@@ -1122,6 +1199,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             state_features=state_features,
             embodiment_id=embodiment_id,
         )
+        _hostprof_toc("diffuse", _hostprof_t, host_timings)
+        _hostprof_pop()
 
         if state.current_start_frame == 1:
             video_out = torch.cat([image, video_out], dim=1)
@@ -1145,16 +1224,27 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
 
         # Squeeze batch dim for output: (B, horizon, dim) → (horizon, dim)
+        _hostprof_push("action_d2h")
+        _hostprof_t = _hostprof_tic()
         actions_np = action_out.squeeze(0).float().cpu().numpy()  # (horizon, max_action_dim)
+        _hostprof_toc("action_d2h", _hostprof_t, host_timings)
+        _hostprof_pop()
         actions_np = transform.transform_action_output(actions_np)
+
+        _hostprof_push("video_d2h")
+        _hostprof_t = _hostprof_tic()
+        # Source `video_pred` is normalized VAE latent output, not RGB.
+        # Use `decode_video_latents()` for DreamZero-equivalent debug
+        # video decoding.
+        video_cpu = video_out.transpose(1, 2).cpu()
+        _hostprof_toc("video_d2h", _hostprof_t, host_timings)
+        _hostprof_pop()
+        _hostprof_log(host_timings)
 
         return DiffusionOutput(
             output={
                 "actions": actions_np,
-                # Source `video_pred` is normalized VAE latent output, not RGB.
-                # Use `decode_video_latents()` for DreamZero-equivalent debug
-                # video decoding.
-                "video": video_out.transpose(1, 2).cpu(),
+                "video": video_cpu,
             },
         )
 

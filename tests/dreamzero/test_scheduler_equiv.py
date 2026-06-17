@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""W7 bitwise-safety: scheduler construction equivalence.
+"""Host-side bitwise-safety: scheduler construction equivalence.
 
 DreamZero's forward() currently does ``copy.deepcopy(self.scheduler)`` twice per
-step and then calls ``set_timesteps(...)`` on each copy
-(``pipeline_dreamzero.py:917-918``). ``self.scheduler`` is built once in
-``__init__`` and is never mutated afterwards (only its per-step copies are), so
-the W7 host-side optimization replaces the per-step deepcopy with a fresh
-``FlowUniPCMultistepScheduler(...)`` built from the same constructor args.
+step and then calls ``set_timesteps(...)`` on each copy. ``self.scheduler`` is
+built once in ``__init__`` and is never mutated afterwards (only its per-step
+copies are), so the host-side optimization replaces the per-step deepcopy with a
+fresh ``FlowUniPCMultistepScheduler(...)`` built from the same constructor args.
 
 These tests prove that swap is *bitwise-identical*: a deepcopy of the pristine
 template followed by ``set_timesteps`` produces exactly the same ``timesteps``
