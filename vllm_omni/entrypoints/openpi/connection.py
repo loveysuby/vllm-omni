@@ -8,9 +8,13 @@ Protocol (compatible with OpenPI policy clients):
     Infer    -> client sends msgpack(obs), server sends msgpack(ndarray)
     Reset    -> client sends msgpack({endpoint:reset}), server sends msgpack(status)
 
-NumPy values use the msgpack-numpy marker mapping:
-    ndarray -> {nd: true, type, kind, shape, data}
-    scalar  -> {nd: false, type, kind, data}
+NumPy values use the ``openpi-client`` wire format (``openpi_client.msgpack_numpy``)
+so that off-the-shelf OpenPI policy clients interoperate without modification:
+    ndarray -> {__ndarray__: true, data: bytes, dtype, shape}
+    scalar  -> {__npgeneric__: true, data: <python scalar>, dtype}
+
+For backward compatibility the decoder also accepts the legacy msgpack-numpy
+marker mapping (``{nd, type, kind, data, shape}``) emitted by older builds.
 """
 
 from __future__ import annotations
@@ -41,18 +45,18 @@ def _pack_numpy(obj: Any) -> Any:
         if not obj.flags.c_contiguous:
             obj = np.ascontiguousarray(obj)
         return {
-            b"nd": True,
+            b"__ndarray__": True,
             b"data": obj.tobytes(),
-            b"type": obj.dtype.str,
-            b"kind": obj.dtype.kind,
+            b"dtype": obj.dtype.str,
             b"shape": obj.shape,
         }
     if isinstance(obj, np.generic):
+        # openpi-client stores the scalar as a native Python value (``obj.item()``)
+        # and decodes it via ``np.dtype(dtype).type(data)``.
         return {
-            b"nd": False,
-            b"data": obj.tobytes(),
-            b"type": obj.dtype.str,
-            b"kind": obj.dtype.kind,
+            b"__npgeneric__": True,
+            b"data": obj.item(),
+            b"dtype": obj.dtype.str,
         }
     raise TypeError(f"Unsupported type: {type(obj)!r}")
 
@@ -67,27 +71,69 @@ def _decode_marker_text(value: Any) -> str:
     return str(value)
 
 
+def _reject_unsupported_dtype(dtype_obj: np.dtype) -> None:
+    if dtype_obj.kind in ("V", "O", "c"):
+        raise ValueError(f"Unsupported dtype: {dtype_obj}")
+
+
+def _decode_numpy_marker(obj: dict[Any, Any]) -> Any:
+    """Decode a NumPy marker dict, or return ``_MISSING`` if it is not one.
+
+    Accepts both the ``openpi-client`` wire format (``__ndarray__`` /
+    ``__npgeneric__``) sent by real OpenPI policy clients, and the legacy
+    msgpack-numpy format (``nd`` / ``type`` / ``kind``) emitted by older
+    builds, so a single server interoperates with either.
+    """
+    # openpi-client ndarray: {__ndarray__: True, data: bytes, dtype, shape}
+    if _mapping_get(obj, "__ndarray__", _MISSING) is not _MISSING:
+        data = _mapping_get(obj, "data", _MISSING)
+        dtype = _mapping_get(obj, "dtype", _MISSING)
+        shape = _mapping_get(obj, "shape", _MISSING)
+        if data is _MISSING or dtype is _MISSING or shape is _MISSING:
+            raise ValueError("Malformed __ndarray__ marker")
+        dtype_obj = np.dtype(_decode_marker_text(dtype))
+        _reject_unsupported_dtype(dtype_obj)
+        # frombuffer is zero-copy but read-only; copy so downstream torch.from_numpy
+        # (which requires a writable buffer) accepts the array.
+        return np.frombuffer(data, dtype=dtype_obj).reshape(tuple(shape)).copy()
+
+    # openpi-client scalar: {__npgeneric__: True, data: <python scalar>, dtype}
+    if _mapping_get(obj, "__npgeneric__", _MISSING) is not _MISSING:
+        data = _mapping_get(obj, "data", _MISSING)
+        dtype = _mapping_get(obj, "dtype", _MISSING)
+        if data is _MISSING or dtype is _MISSING:
+            raise ValueError("Malformed __npgeneric__ marker")
+        dtype_obj = np.dtype(_decode_marker_text(dtype))
+        _reject_unsupported_dtype(dtype_obj)
+        return dtype_obj.type(data)
+
+    # Legacy msgpack-numpy: {nd, type, kind, data, [shape]}
+    nd = _mapping_get(obj, "nd", _MISSING)
+    dtype = _mapping_get(obj, "type", _MISSING)
+    kind = _mapping_get(obj, "kind", _MISSING)
+    data = _mapping_get(obj, "data", _MISSING)
+    if nd is not _MISSING and dtype is not _MISSING and kind is not _MISSING and data is not _MISSING:
+        dtype_obj = np.dtype(_decode_marker_text(dtype))
+        kind_text = _decode_marker_text(kind)
+        if dtype_obj.kind != kind_text:
+            raise ValueError(f"NumPy dtype marker kind mismatch: {dtype_obj.kind!r} != {kind_text!r}")
+        _reject_unsupported_dtype(dtype_obj)
+        array = np.frombuffer(data, dtype=dtype_obj).copy()
+        if nd:
+            shape = _mapping_get(obj, "shape", _MISSING)
+            if shape is _MISSING:
+                raise ValueError("NumPy ndarray marker is missing shape")
+            return array.reshape(tuple(shape))
+        return array[0]
+
+    return _MISSING
+
+
 def _unpack_numpy(obj: Any) -> Any:
     if isinstance(obj, dict):
-        nd = _mapping_get(obj, "nd", _MISSING)
-        dtype = _mapping_get(obj, "type", _MISSING)
-        kind = _mapping_get(obj, "kind", _MISSING)
-        data = _mapping_get(obj, "data", _MISSING)
-        if nd is not _MISSING and dtype is not _MISSING and kind is not _MISSING and data is not _MISSING:
-            dtype_obj = np.dtype(_decode_marker_text(dtype))
-            kind_text = _decode_marker_text(kind)
-            if dtype_obj.kind != kind_text:
-                raise ValueError(f"NumPy dtype marker kind mismatch: {dtype_obj.kind!r} != {kind_text!r}")
-            if dtype_obj.kind in ("V", "O", "c"):
-                raise ValueError(f"Unsupported dtype: {dtype_obj}")
-
-            array = np.frombuffer(data, dtype=dtype_obj).copy()
-            if nd:
-                shape = _mapping_get(obj, "shape", _MISSING)
-                if shape is _MISSING:
-                    raise ValueError("NumPy ndarray marker is missing shape")
-                return array.reshape(tuple(shape))
-            return array[0]
+        decoded = _decode_numpy_marker(obj)
+        if decoded is not _MISSING:
+            return decoded
         return {key: _unpack_numpy(value) for key, value in obj.items()}
     if isinstance(obj, list):
         return [_unpack_numpy(value) for value in obj]

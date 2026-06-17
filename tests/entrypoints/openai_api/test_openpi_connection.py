@@ -88,6 +88,66 @@ def test_unpack_accepts_msgpack_numpy_marker_dicts():
     np.testing.assert_allclose(decoded[b"actions"], np.asarray([[1.0, 0.0]], dtype=np.float32))
 
 
+def test_unpack_accepts_openpi_client_ndarray_marker():
+    # openpi-client (openpi_client.msgpack_numpy) packs ndarrays with the
+    # ``__ndarray__`` marker -- regression guard for #4282, which only decoded
+    # the legacy ``{nd, type, kind}`` markers and left these dicts undecoded.
+    action = np.asarray([[1.0, 2.0]], dtype=np.float32)
+    payload = {
+        b"actions": {
+            b"__ndarray__": True,
+            b"data": action.tobytes(),
+            b"dtype": action.dtype.str,
+            b"shape": action.shape,
+        }
+    }
+
+    decoded = openpi_connection._unpack_numpy(payload)
+
+    assert isinstance(decoded[b"actions"], np.ndarray)
+    np.testing.assert_allclose(decoded[b"actions"], action)
+    assert decoded[b"actions"].dtype == np.float32
+    assert decoded[b"actions"].flags.writeable is True
+
+
+def test_unpack_accepts_openpi_client_npgeneric_marker():
+    # openpi-client stores scalars as a native Python value under ``__npgeneric__``.
+    payload = {b"reward": {b"__npgeneric__": True, b"data": 3.5, b"dtype": "<f4"}}
+
+    decoded = openpi_connection._unpack_numpy(payload)
+
+    assert decoded[b"reward"] == np.float32(3.5)
+    assert isinstance(decoded[b"reward"], np.float32)
+
+
+def test_round_trip_with_real_openpi_client_packer():
+    # End-to-end regression for #4282: a payload packed by the real
+    # openpi-client must decode to ndarrays on the server, and a server
+    # response must decode to ndarrays on the openpi-client. Skipped when the
+    # optional dependency is absent (standard PR CI), exercised when present.
+    msgpack_numpy = pytest.importorskip("openpi_client.msgpack_numpy")
+
+    obs = {
+        "observation/image": np.arange(2 * 4 * 3, dtype=np.uint8).reshape(2, 4, 3),
+        "prompt": "pick up the object",
+        "reset": np.bool_(True),
+    }
+
+    # client -> server
+    decoded = openpi_connection._unpack(msgpack_numpy.Packer().pack(obs))
+    assert isinstance(decoded["observation/image"], np.ndarray)
+    np.testing.assert_array_equal(decoded["observation/image"], obs["observation/image"])
+    assert decoded["observation/image"].flags.writeable is True
+    assert decoded["prompt"] == "pick up the object"
+    assert decoded["reset"] == np.bool_(True)
+
+    # server -> client
+    actions = np.ones((1, 7), dtype=np.float32)
+    client_view = msgpack_numpy.unpackb(openpi_connection._pack({"actions": actions}))
+    assert isinstance(client_view["actions"], np.ndarray)
+    np.testing.assert_allclose(client_view["actions"], actions)
+
+
 def test_unpack_leaves_user_dict_without_numpy_kind_marker_unchanged():
     payload = {
         "metadata": {
