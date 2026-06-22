@@ -593,7 +593,13 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         bitwise-safe: identical constant input -> identical tokens -> identical
         UMT5 eval forward -> identical embeds. Downstream cross-attention treats
         the embeds as read-only (encoder_hidden_states), so reusing the cached
-        tensor does not change outputs (validated by the W7 on/off bitwise test).
+        tensor does not change the math. This is pure constant-folding of a
+        deterministic pure function, verified in-process by
+        ``tests/dreamzero/test_neg_embed_cache_equiv.py`` (cached == recomputed,
+        byte-identical, device-keyed). NB: an end-to-end on/off output digest does
+        NOT verify this -- the GPU forward is not bitwise-reproducible run-to-run
+        (bf16 + flash-attn + CUDA graph), so the flag is invisible against kernel
+        noise; the contract is established structurally, not by output diffing.
         """
         if _W7_OPT_ENABLED:
             cached = getattr(self, "_w7_neg_embed_cache", None)
