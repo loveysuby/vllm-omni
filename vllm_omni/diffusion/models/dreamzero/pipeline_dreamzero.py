@@ -75,6 +75,9 @@ _HOSTPROF_NVTX = _HOSTPROF_ENABLED and torch.cuda.is_available()
 # [WIP] W7 host-side optimizations, opt-in via DREAMZERO_W7_OPT=1.
 # When off, the code paths are byte-identical to the current baseline.
 _W7_OPT_ENABLED = os.environ.get("DREAMZERO_W7_OPT", "0") == "1"
+# Max distinct prompts cached by the positive-prompt encode LRU (W7 P2-a).
+# A closed-loop session usually keeps one task prompt; a few covers prompt switches.
+_W7_POS_CACHE_MAX = 4
 
 
 def _hostprof_tic() -> float | None:
@@ -621,6 +624,59 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             self._w7_neg_embed_cache = (device, neg_embeds)
         return neg_embeds
 
+    def _encode_positive_prompt(
+        self, prompt_str: str, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tokenize + UMT5-encode the task prompt for the CFG cond branch.
+
+        Within a closed-loop session the task prompt is constant across steps, so
+        the tokenize + UMT5 forward (``encode_text_pos`` ~28ms, p99 221ms) is
+        recomputed redundantly every step. With W7 host-opt
+        (``DREAMZERO_W7_OPT=1``) the ``(text_tokens, attention_mask,
+        prompt_embeds)`` triple is cached per ``(prompt_str, device)`` in a small
+        LRU; a hit skips both the tokenizer and the UMT5 forward. When off this is
+        exactly the original per-step path (tokenize then encode), just folded
+        into one call.
+
+        Returns ``(text_tokens, attention_mask, prompt_embeds)`` -- the tokens and
+        mask are returned too because the reset logic and ``state.language`` need
+        the same tokens (so a hit also avoids re-tokenizing).
+
+        bitwise-safe: identical ``prompt_str`` -> identical tokens (deterministic
+        tokenizer) -> identical UMT5 eval forward -> identical embeds; downstream
+        cross-attention treats the embeds as read-only. This is pure
+        constant-folding of a deterministic pure function, verified in-process by
+        ``tests/dreamzero/test_pos_embed_cache_equiv.py``. As with the neg cache,
+        an end-to-end on/off output digest does NOT verify this -- the GPU forward
+        is not bitwise-reproducible run-to-run.
+        """
+        if _W7_OPT_ENABLED:
+            cache = getattr(self, "_w7_pos_cache", None)
+            if cache is None:
+                cache = self._w7_pos_cache = OrderedDict()
+            key = (prompt_str, device)
+            hit = cache.get(key)
+            if hit is not None:
+                cache.move_to_end(key)
+                return hit
+        text_inputs = self.tokenizer(
+            prompt_str,
+            max_length=512,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+        text_tokens = text_inputs["input_ids"].to(device)
+        attention_mask = text_inputs["attention_mask"].to(device)
+        prompt_embeds = self._encode_text(text_tokens, attention_mask)
+        result = (text_tokens, attention_mask, prompt_embeds)
+        if _W7_OPT_ENABLED:
+            cache[key] = result
+            if len(cache) > _W7_POS_CACHE_MAX:
+                cache.popitem(last=False)
+        return result
+
     # -----------------------------------------------------------------------
     # Image encoding
     # -----------------------------------------------------------------------
@@ -1051,20 +1107,16 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         else:
             state_features = None
 
-        # ---- Step 1b: Tokenize ---- (wan2_2 convention: pipeline owns tokenizer)
-        _hostprof_push("tokenize_pos")
+        # ---- Step 1b: Tokenize + encode prompt ----
+        # (wan2_2 convention: pipeline owns tokenizer.) W7 P2-a folds tokenize +
+        # UMT5 encode into one cached call: the task prompt is constant within a
+        # session, so the encode is moved up and reused. Safe to compute the
+        # embeds here -- they depend only on (tokens, mask, text_encoder weights),
+        # none of which the intervening reset/frame-accumulate logic touches.
+        _hostprof_push("encode_text_pos")
         _hostprof_t = _hostprof_tic()
-        text_inputs = self.tokenizer(
-            prompt_str,
-            max_length=512,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-            add_special_tokens=True,
-        )
-        text_tokens = text_inputs["input_ids"].to(device)
-        attention_mask = text_inputs["attention_mask"].to(device)
-        _hostprof_toc("tokenize_pos", _hostprof_t, host_timings)
+        text_tokens, attention_mask, prompt_embeds = self._encode_positive_prompt(prompt_str, device)
+        _hostprof_toc("encode_text_pos", _hostprof_t, host_timings)
         _hostprof_pop()
 
         # Explicit reset from OpenPI serving is carried by `extra_args["reset"]`
@@ -1093,11 +1145,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         videos = self._preprocess_video(videos)  # → [B,C,T,H,W] bf16
         _, _, num_frames_raw, height, width = videos.shape
 
-        _hostprof_push("encode_text_pos")
-        _hostprof_t = _hostprof_tic()
-        prompt_embeds = self._encode_text(text_tokens, attention_mask)
-        _hostprof_toc("encode_text_pos", _hostprof_t, host_timings)
-        _hostprof_pop()
+        # (prompt_embeds computed above via _encode_positive_prompt)
         # Negative prompt for CFG uncond branch (model constant)
         negative_prompt_embeds = None
         if self.cfg_scale > 1.0:
