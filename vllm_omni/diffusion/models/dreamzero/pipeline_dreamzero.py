@@ -72,6 +72,10 @@ MAX_DREAMZERO_SESSIONS = 64
 _HOSTPROF_ENABLED = os.environ.get("DREAMZERO_PROFILE_HOST", "0") == "1"
 _HOSTPROF_NVTX = _HOSTPROF_ENABLED and torch.cuda.is_available()
 
+# [WIP] W7 host-side optimizations, opt-in via DREAMZERO_W7_OPT=1.
+# When off, the code paths are byte-identical to the current baseline.
+_W7_OPT_ENABLED = os.environ.get("DREAMZERO_W7_OPT", "0") == "1"
+
 
 def _hostprof_tic() -> float | None:
     return time.perf_counter() if _HOSTPROF_ENABLED else None
@@ -578,6 +582,39 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             prompt_emb[:, v:] = 0
         return prompt_emb
 
+    def _encode_negative_prompt(self, device: torch.device) -> torch.Tensor:
+        """Encode the constant negative prompt for the CFG uncond branch.
+
+        ``self.negative_prompt`` is a model constant, so the tokenize + UMT5
+        encode produces the same embeds every step. With W7 host-opt
+        (``DREAMZERO_W7_OPT=1``) it is computed once and reused per device;
+        when off this is exactly the original per-call path.
+
+        bitwise-safe: identical constant input -> identical tokens -> identical
+        UMT5 eval forward -> identical embeds. Downstream cross-attention treats
+        the embeds as read-only (encoder_hidden_states), so reusing the cached
+        tensor does not change outputs (validated by the W7 on/off bitwise test).
+        """
+        if _W7_OPT_ENABLED:
+            cached = getattr(self, "_w7_neg_embed_cache", None)
+            if cached is not None and cached[0] == device:
+                return cached[1]
+        neg_inputs = self.tokenizer(
+            self.negative_prompt,
+            max_length=512,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+        neg_embeds = self._encode_text(
+            neg_inputs["input_ids"].to(device),
+            neg_inputs["attention_mask"].to(device),
+        )
+        if _W7_OPT_ENABLED:
+            self._w7_neg_embed_cache = (device, neg_embeds)
+        return neg_embeds
+
     # -----------------------------------------------------------------------
     # Image encoding
     # -----------------------------------------------------------------------
@@ -1060,18 +1097,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         if self.cfg_scale > 1.0:
             _hostprof_push("neg_embed")
             _hostprof_t = _hostprof_tic()
-            neg_inputs = self.tokenizer(
-                self.negative_prompt,
-                max_length=512,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
-                add_special_tokens=True,
-            )
-            negative_prompt_embeds = self._encode_text(
-                neg_inputs["input_ids"].to(device),
-                neg_inputs["attention_mask"].to(device),
-            )
+            negative_prompt_embeds = self._encode_negative_prompt(device)
             _hostprof_toc("neg_embed", _hostprof_t, host_timings)
             _hostprof_pop()
 
