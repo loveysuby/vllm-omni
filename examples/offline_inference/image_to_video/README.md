@@ -30,7 +30,7 @@ This folder provides a unified CLI script for image-to-video generation using vL
 !!! info
     Peak VRAM: based on basic single-card usage, batch size = 1, without any acceleration/optimization features. Some model weights cannot fit into one card with 80 GiB VRAM, which may need to use CPU offloading.
 
-Default model: `Wan-AI/Wan2.2-I2V-A14B-Diffusers`
+Default model: `Wan-AI/Wan2.2-I2V-A14B-Diffusers`.
 
 ## Prerequisites
 
