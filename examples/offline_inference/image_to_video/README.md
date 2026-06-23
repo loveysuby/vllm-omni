@@ -1,6 +1,8 @@
 # Image-To-Video
 
-Generate videos from images using vLLM-Omni's offline inference API. Supports Wan2.2, LTX2, and HunyuanVideo-1.5 image-to-video pipelines.
+This example demonstrates how to generate videos from images (image-to-video)
+using Wan2.2, LTX2, HunyuanVideo-1.5, and Cosmos3 with vLLM-Omni's offline
+inference API.
 
 - `image_to_video.py`: command-line script for single video generation with advanced options.
 
@@ -230,6 +232,49 @@ python image_to_video.py \
 ```
 
 ### LoRA
+### Cosmos3
+
+```bash
+# Cosmos3 bundles example frames under assets/ (any RGB image works too):
+python image_to_video.py \
+  --model nvidia/Cosmos3-Nano \
+  --image /path/to/Cosmos3-Nano/assets/example_i2v_input.jpg \
+  --prompt "The scene comes to life with smooth, natural motion." \
+  --negative-prompt "blurry, distorted, low quality" \
+  --height 720 --width 1280 --num-frames 189 --fps 24 \
+  --num-inference-steps 35 --guidance-scale 6.0 \
+  --extra-body '{"flow_shift": 10.0, "max_sequence_length": 4096, "guardrails": false}' \
+  --output cosmos3_i2v.mp4
+```
+
+Key arguments:
+
+- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V).
+- `--image`: Path to input image (required).
+- `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3.
+- `--prompt`: Text description of desired motion/animation.
+- `--height/--width`: Output resolution (auto-calculated from image if not set). Dimensions should be multiples of 16.
+- `--num-frames`: Number of frames (default: model-specific — Wan 81, LTX2 121, Cosmos3 189).
+- `--guidance-scale` and `--guidance-scale-high`: CFG scale (applied to low/high-noise stages for MoE).
+- `--negative-prompt`: Optional list of artifacts to suppress.
+- `--boundary-ratio`: Boundary split ratio for two-stage MoE models.
+- `--flow-shift`: Scheduler flow shift (default: model-specific — Wan/LTX2 5.0, Cosmos3 10.0).
+- `--sample-solver`: Wan2.2 sampling solver. Use `unipc` for the default multistep solver, or `euler` for Lightning/Distill checkpoints.
+- `--num-inference-steps`: Number of denoising steps (default: model-specific — Wan 50, LTX2 40, Cosmos3 35).
+- `--fps`: Frames per second for the saved MP4 (requires `diffusers` export_to_video).
+- `--output`: Path to save the generated video.
+- `--vae-use-slicing`: Enable VAE slicing for memory optimization.
+- `--vae-use-tiling`: Enable VAE tiling for memory optimization.
+- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion/parallelism/cfg_parallel.md).
+- `--tensor-parallel-size`: tensor parallel size (effective for models that support TP, e.g. LTX2).
+- `--enable-cpu-offload`: enable CPU offloading for diffusion models.
+- `--use-hsdp`: Enable Hybrid Sharded Data Parallel to shard model weights across GPUs.
+- `--hsdp-shard-size`: Number of GPUs to shard model weights across within each replica group. -1 (default) auto-calculates as world_size / replicate_size.
+- `--hsdp-replicate-size`: Number of replica groups for HSDP. Each replica holds a full sharded copy. Default 1 means pure sharding (no replication).
+
+
+
+> ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
 
 For Wan2.2 LightX2V-converted local Diffusers directories and related LoRA
 assets, see the [LoRA guide](../../../docs/user_guide/diffusion/lora.md#wan22-lightx2v-offline-assembly).
