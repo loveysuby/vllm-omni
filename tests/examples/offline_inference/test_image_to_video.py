@@ -4,10 +4,10 @@ See examples/offline_inference/image_to_video/README.md
 """
 
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+import requests
 
 from tests.examples.helpers import EXAMPLES, ExampleRunner, ReadmeSnippet
 from tests.helpers.assertions import assert_video_valid
@@ -42,8 +42,10 @@ def _ensure_test_image(run_dir: Path) -> None:
     src = I2V_SCRIPT.parent / _IMAGE_NAME
     if src.exists():
         shutil.copy2(src, dest)
-    else:
-        subprocess.check_call(["wget", "-q", "-O", str(dest), _IMAGE_URL])
+        return
+    response = requests.get(_IMAGE_URL, timeout=60)
+    response.raise_for_status()
+    dest.write_bytes(response.content)
 
 
 def _skip_readme_snippet(language: str, code: str, h2_title: str) -> tuple[bool, str]:
