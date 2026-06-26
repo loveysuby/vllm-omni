@@ -690,6 +690,7 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "active_stream_window",
     "custom_voice_dir",
 )
+PIPELINE_WIDE_ENGINE_FIELDS = _PIPELINE_WIDE_ENGINE_FIELDS
 
 
 def _build_engine_args(
@@ -706,6 +707,8 @@ def _build_engine_args(
     ``engine_extras`` can still carry a stage-specific ``dtype``).
     """
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch}
+    if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
+        engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type:
         engine_args["engine_output_type"] = ps.engine_output_type
     if next_stage_proc:
