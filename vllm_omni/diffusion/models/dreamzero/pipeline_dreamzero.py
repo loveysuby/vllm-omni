@@ -248,11 +248,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         transformer_kwargs["num_frame_per_block"] = ah_config["num_frame_per_block"]
         self.transformer = CausalWanModel(**transformer_kwargs)
 
-        self.scheduler = FlowUniPCMultistepScheduler(
-            num_train_timesteps=1000,
-            shift=1,
-            use_dynamic_shifting=False,
-        )
+        self.scheduler = self._make_scheduler()
 
         self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
         self._max_session_states = MAX_DREAMZERO_SESSIONS
@@ -588,12 +584,54 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             prompt_emb[:, v:] = 0
         return prompt_emb
 
+    @staticmethod
+    def _make_scheduler() -> FlowUniPCMultistepScheduler:
+        """Construct a fresh inference scheduler (single source of truth).
+
+        ``__init__`` and the per-forward build both go through here, so their
+        constructor args can never drift -- the W7 fresh-build path is only
+        bitwise-equivalent to the baseline deepcopy while the two stay in sync.
+        Pure function of constants; mirrors the original inline ``__init__``
+        construction (``num_train_timesteps=1000, shift=1,
+        use_dynamic_shifting=False``).
+        """
+        return FlowUniPCMultistepScheduler(
+            num_train_timesteps=1000,
+            shift=1,
+            use_dynamic_shifting=False,
+        )
+
+    def _build_inference_scheduler(self) -> FlowUniPCMultistepScheduler:
+        """Return a pristine scheduler for one denoise loop.
+
+        ``forward()`` needs a fresh, unmutated scheduler per call because
+        ``set_timesteps``/``.step()`` mutate it. The baseline deep-copies the
+        ``__init__`` template (``copy.deepcopy(self.scheduler)``); ``self.scheduler``
+        is built once and never mutated after ``__init__`` (only its per-forward
+        copies are). With ``VLLM_OMNI_SCHEDULER_FRESH_BUILD=1`` we skip the deepcopy
+        -- a Python-level recursive copy of the scheduler's 1000-element
+        sigma/timestep tensors + config dict, run twice per forward (host label
+        ``sched_deepcopy``) -- and construct a fresh scheduler whose schedule is
+        recomputed in numpy/C instead. When off this is exactly the original path.
+
+        bitwise-safe and, unlike the embed caches, *directly* verifiable: scheduler
+        construction has no bf16/flash-attn/CUDA-graph nondeterminism, so
+        ``fresh()+set_timesteps`` and ``deepcopy(template)+set_timesteps`` yield
+        byte-identical ``timesteps``/``sigmas`` (including the
+        ``decouple_inference_noise`` rescale). Verified by
+        ``tests/dreamzero/test_scheduler_equiv.py`` (math swap) and
+        ``tests/dreamzero/test_scheduler_cache_equiv.py`` (this pipeline wiring).
+        """
+        if _SCHEDULER_FRESH_BUILD:
+            return self._make_scheduler()
+        return copy.deepcopy(self.scheduler)
+
     def _encode_negative_prompt(self, device: torch.device) -> torch.Tensor:
         """Encode the constant negative prompt for the CFG uncond branch.
 
         ``self.negative_prompt`` is a model constant, so the tokenize + UMT5
         encode produces the same embeds every step. With W7 host-opt
-        (``DREAMZERO_W7_OPT=1``) it is computed once and reused per device;
+        (``VLLM_OMNI_CACHE_NEG_PROMPT_EMBED=1``) it is computed once and reused per device;
         when off this is exactly the original per-call path.
 
         bitwise-safe: identical constant input -> identical tokens -> identical
@@ -1238,8 +1276,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         _hostprof_push("sched_deepcopy")
         _hostprof_t = _hostprof_tic()
-        sample_scheduler = copy.deepcopy(self.scheduler)
-        sample_scheduler_action = copy.deepcopy(self.scheduler)
+        sample_scheduler = self._build_inference_scheduler()
+        sample_scheduler_action = self._build_inference_scheduler()
         _hostprof_toc("sched_deepcopy", _hostprof_t, host_timings)
         _hostprof_pop()
         sample_scheduler.set_timesteps(
