@@ -5,7 +5,7 @@
 
 DreamZero re-tokenizes + UMT5-encodes the task prompt on *every* step
 (``encode_text_pos`` ~28ms, p99 221ms). Within a closed-loop session the prompt
-is constant, so the host-side W7 optimization (``DREAMZERO_W7_OPT=1``) caches the
+is constant, so the host-side W7 optimization (``VLLM_OMNI_CACHE_PROMPT_EMBED=1``) caches the
 ``(text_tokens, attention_mask, prompt_embeds)`` triple per ``(prompt_str,
 device)`` in a small LRU (``pipeline_dreamzero.py:_encode_positive_prompt``).
 
@@ -60,7 +60,7 @@ def _make_stub_pipeline(counter: dict) -> object:
 
 def test_off_recomputes_every_call(monkeypatch: pytest.MonkeyPatch) -> None:
     """W7 OFF == original path: tokenize + encode run once per step (no cache)."""
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", False)
+    monkeypatch.setattr(P, "_CACHE_PROMPT_EMBED", False)
     counter = {"tok": 0, "enc": 0}
     obj = _make_stub_pipeline(counter)
     dev = torch.device("cpu")
@@ -70,12 +70,12 @@ def test_off_recomputes_every_call(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert counter["tok"] == 3
     assert counter["enc"] == 3
-    assert not hasattr(obj, "_w7_pos_cache")  # OFF leaves no cache state
+    assert not hasattr(obj, "_pos_cache")  # OFF leaves no cache state
 
 
 def test_on_computes_once_per_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     """W7 ON: same prompt -> tokenize + encode once; later calls reuse the triple."""
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", True)
+    monkeypatch.setattr(P, "_CACHE_PROMPT_EMBED", True)
     counter = {"tok": 0, "enc": 0}
     obj = _make_stub_pipeline(counter)
     dev = torch.device("cpu")
@@ -95,10 +95,10 @@ def test_on_equals_off_bitwise(monkeypatch: pytest.MonkeyPatch) -> None:
     prompt = "put the cube in the bowl"
     dev = torch.device("cpu")
 
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", False)
+    monkeypatch.setattr(P, "_CACHE_PROMPT_EMBED", False)
     t_off, m_off, e_off = _make_stub_pipeline({"tok": 0, "enc": 0})._encode_positive_prompt(prompt, dev)
 
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", True)
+    monkeypatch.setattr(P, "_CACHE_PROMPT_EMBED", True)
     t_on, m_on, e_on = _make_stub_pipeline({"tok": 0, "enc": 0})._encode_positive_prompt(prompt, dev)
 
     assert e_on.dtype == e_off.dtype and e_on.shape == e_off.shape
@@ -109,7 +109,7 @@ def test_on_equals_off_bitwise(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_different_prompt_recomputes(monkeypatch: pytest.MonkeyPatch) -> None:
     """A different prompt is a cache miss; distinct prompts -> distinct embeds."""
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", True)
+    monkeypatch.setattr(P, "_CACHE_PROMPT_EMBED", True)
     counter = {"tok": 0, "enc": 0}
     obj = _make_stub_pipeline(counter)
     dev = torch.device("cpu")
@@ -125,17 +125,17 @@ def test_different_prompt_recomputes(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_lru_evicts_oldest(monkeypatch: pytest.MonkeyPatch) -> None:
     """The LRU is bounded; the oldest prompt is evicted and then recomputed."""
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", True)
+    monkeypatch.setattr(P, "_CACHE_PROMPT_EMBED", True)
     counter = {"tok": 0, "enc": 0}
     obj = _make_stub_pipeline(counter)
     dev = torch.device("cpu")
-    n = P._W7_POS_CACHE_MAX
+    n = P._POS_CACHE_MAX
 
     # Fill the cache exactly, then insert one more -> evicts the first ("p0").
     for i in range(n + 1):
         obj._encode_positive_prompt(f"prompt {i}", dev)
     assert counter["enc"] == n + 1
-    assert len(obj._w7_pos_cache) == n
+    assert len(obj._pos_cache) == n
 
     obj._encode_positive_prompt("prompt 0", dev)  # evicted -> recompute
     assert counter["enc"] == n + 2
@@ -143,7 +143,7 @@ def test_lru_evicts_oldest(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_cache_is_device_keyed(monkeypatch: pytest.MonkeyPatch) -> None:
     """A different device key forces a recompute (no cross-device tensor reuse)."""
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", True)
+    monkeypatch.setattr(P, "_CACHE_PROMPT_EMBED", True)
     counter = {"tok": 0, "enc": 0}
     obj = _make_stub_pipeline(counter)
     prompt = "put the cube in the bowl"

@@ -24,6 +24,7 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.cache.stepcache import (
     get_stepcache_state,
     is_stepcache_active,
@@ -72,12 +73,14 @@ MAX_DREAMZERO_SESSIONS = 64
 _HOSTPROF_ENABLED = os.environ.get("DREAMZERO_PROFILE_HOST", "0") == "1"
 _HOSTPROF_NVTX = _HOSTPROF_ENABLED and torch.cuda.is_available()
 
-# [WIP] W7 host-side optimizations, opt-in via DREAMZERO_W7_OPT=1.
-# When off, the code paths are byte-identical to the current baseline.
-_W7_OPT_ENABLED = os.environ.get("DREAMZERO_W7_OPT", "0") == "1"
-# Max distinct prompts cached by the positive-prompt encode LRU (W7 P2-a).
+# Host-side optimizations, each opt-in via its own env flag (vllm_omni/diffusion/envs.py).
+# When a flag is off, that code path is byte-identical to the baseline.
+_SCHEDULER_FRESH_BUILD = envs.VLLM_OMNI_SCHEDULER_FRESH_BUILD
+_CACHE_NEG_PROMPT_EMBED = envs.VLLM_OMNI_CACHE_NEG_PROMPT_EMBED
+_CACHE_PROMPT_EMBED = envs.VLLM_OMNI_CACHE_PROMPT_EMBED
+# Max distinct prompts cached by the positive-prompt encode LRU.
 # A closed-loop session usually keeps one task prompt; a few covers prompt switches.
-_W7_POS_CACHE_MAX = 4
+_POS_CACHE_MAX = 4
 
 
 def _hostprof_tic() -> float | None:
@@ -604,8 +607,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         (bf16 + flash-attn + CUDA graph), so the flag is invisible against kernel
         noise; the contract is established structurally, not by output diffing.
         """
-        if _W7_OPT_ENABLED:
-            cached = getattr(self, "_w7_neg_embed_cache", None)
+        if _CACHE_NEG_PROMPT_EMBED:
+            cached = getattr(self, "_neg_embed_cache", None)
             if cached is not None and cached[0] == device:
                 return cached[1]
         neg_inputs = self.tokenizer(
@@ -620,8 +623,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             neg_inputs["input_ids"].to(device),
             neg_inputs["attention_mask"].to(device),
         )
-        if _W7_OPT_ENABLED:
-            self._w7_neg_embed_cache = (device, neg_embeds)
+        if _CACHE_NEG_PROMPT_EMBED:
+            self._neg_embed_cache = (device, neg_embeds)
         return neg_embeds
 
     def _encode_positive_prompt(
@@ -632,7 +635,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         Within a closed-loop session the task prompt is constant across steps, so
         the tokenize + UMT5 forward (``encode_text_pos`` ~28ms, p99 221ms) is
         recomputed redundantly every step. With W7 host-opt
-        (``DREAMZERO_W7_OPT=1``) the ``(text_tokens, attention_mask,
+        (``VLLM_OMNI_CACHE_PROMPT_EMBED=1``) the ``(text_tokens, attention_mask,
         prompt_embeds)`` triple is cached per ``(prompt_str, device)`` in a small
         LRU; a hit skips both the tokenizer and the UMT5 forward. When off this is
         exactly the original per-step path (tokenize then encode), just folded
@@ -650,10 +653,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         an end-to-end on/off output digest does NOT verify this -- the GPU forward
         is not bitwise-reproducible run-to-run.
         """
-        if _W7_OPT_ENABLED:
-            cache = getattr(self, "_w7_pos_cache", None)
+        if _CACHE_PROMPT_EMBED:
+            cache = getattr(self, "_pos_cache", None)
             if cache is None:
-                cache = self._w7_pos_cache = OrderedDict()
+                cache = self._pos_cache = OrderedDict()
             key = (prompt_str, device)
             hit = cache.get(key)
             if hit is not None:
@@ -671,9 +674,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         attention_mask = text_inputs["attention_mask"].to(device)
         prompt_embeds = self._encode_text(text_tokens, attention_mask)
         result = (text_tokens, attention_mask, prompt_embeds)
-        if _W7_OPT_ENABLED:
+        if _CACHE_PROMPT_EMBED:
             cache[key] = result
-            if len(cache) > _W7_POS_CACHE_MAX:
+            if len(cache) > _POS_CACHE_MAX:
                 cache.popitem(last=False)
         return result
 

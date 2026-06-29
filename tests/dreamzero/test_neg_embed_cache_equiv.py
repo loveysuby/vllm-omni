@@ -5,13 +5,13 @@
 
 DreamZero re-tokenizes + UMT5-encodes ``self.negative_prompt`` (a model constant)
 on *every* step to build the CFG uncond branch. The host-side W7 optimization
-(``DREAMZERO_W7_OPT=1``) computes it once and reuses it per device
+(``VLLM_OMNI_CACHE_NEG_PROMPT_EMBED=1``) computes it once and reuses it per device
 (``pipeline_dreamzero.py:585-616``).
 
 Why this test exists (and why an end-to-end on/off comparison does NOT prove the
 contract): DreamZero's GPU forward is *not* bitwise-reproducible run-to-run
 (bf16 + cudnn flash-attention + W1 CUDA-graph/torch.compile). Measured on an
-RTX PRO 6000 (Blackwell), two independent ``DREAMZERO_W7_OPT=0`` processes
+RTX PRO 6000 (Blackwell), two independent ``VLLM_OMNI_CACHE_NEG_PROMPT_EMBED=0`` processes
 already disagree on 3/5 steps, and an OPT=0 run matches an OPT=1 run on 4/5 steps
 — i.e. the flag is statistically invisible against run-to-run kernel noise. So a
 cross-process digest of (video, action) cannot isolate the optimization.
@@ -67,7 +67,7 @@ def _make_stub_pipeline(counter: dict) -> object:
 
 def test_off_recomputes_every_call(monkeypatch: pytest.MonkeyPatch) -> None:
     """W7 OFF == original path: the encoder runs once per step (no cache)."""
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", False)
+    monkeypatch.setattr(P, "_CACHE_NEG_PROMPT_EMBED", False)
     counter = {"n": 0}
     obj = _make_stub_pipeline(counter)
     dev = torch.device("cpu")
@@ -76,12 +76,12 @@ def test_off_recomputes_every_call(monkeypatch: pytest.MonkeyPatch) -> None:
         obj._encode_negative_prompt(dev)
 
     assert counter["n"] == 3
-    assert not hasattr(obj, "_w7_neg_embed_cache")  # OFF leaves no cache state
+    assert not hasattr(obj, "_neg_embed_cache")  # OFF leaves no cache state
 
 
 def test_on_computes_once_and_reuses(monkeypatch: pytest.MonkeyPatch) -> None:
     """W7 ON: encode runs exactly once; every later call returns the cached tensor."""
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", True)
+    monkeypatch.setattr(P, "_CACHE_NEG_PROMPT_EMBED", True)
     counter = {"n": 0}
     obj = _make_stub_pipeline(counter)
     dev = torch.device("cpu")
@@ -103,10 +103,10 @@ def test_on_equals_off_bitwise(monkeypatch: pytest.MonkeyPatch) -> None:
     This is the bitwise contract: given a deterministic encoder, caching the
     constant negative prompt yields exactly the same tensor as recomputing it.
     """
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", False)
+    monkeypatch.setattr(P, "_CACHE_NEG_PROMPT_EMBED", False)
     off = _make_stub_pipeline({"n": 0})._encode_negative_prompt(torch.device("cpu"))
 
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", True)
+    monkeypatch.setattr(P, "_CACHE_NEG_PROMPT_EMBED", True)
     on = _make_stub_pipeline({"n": 0})._encode_negative_prompt(torch.device("cpu"))
 
     assert on.dtype == off.dtype
@@ -116,7 +116,7 @@ def test_on_equals_off_bitwise(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_cache_is_device_keyed(monkeypatch: pytest.MonkeyPatch) -> None:
     """A different device key forces a recompute (no cross-device tensor reuse)."""
-    monkeypatch.setattr(P, "_W7_OPT_ENABLED", True)
+    monkeypatch.setattr(P, "_CACHE_NEG_PROMPT_EMBED", True)
     counter = {"n": 0}
     obj = _make_stub_pipeline(counter)
 
