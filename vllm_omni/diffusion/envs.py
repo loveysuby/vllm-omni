@@ -13,8 +13,6 @@ if TYPE_CHECKING:
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
     VLLM_OMNI_SCHEDULER_FRESH_BUILD: bool = False
-    VLLM_OMNI_CACHE_NEG_PROMPT_EMBED: bool = False
-    VLLM_OMNI_CACHE_PROMPT_EMBED: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
@@ -32,10 +30,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build a fresh inference scheduler per forward instead of deep-copying the
     # template each call (skips the per-forward copy.deepcopy of the scheduler).
     "VLLM_OMNI_SCHEDULER_FRESH_BUILD": lambda: os.environ.get("VLLM_OMNI_SCHEDULER_FRESH_BUILD", "0") == "1",
-    # Cache the constant negative-prompt embeds (CFG uncond branch), keyed by device.
-    "VLLM_OMNI_CACHE_NEG_PROMPT_EMBED": lambda: os.environ.get("VLLM_OMNI_CACHE_NEG_PROMPT_EMBED", "0") == "1",
-    # Cache the positive (task) prompt encode per (prompt, device) in a small LRU.
-    "VLLM_OMNI_CACHE_PROMPT_EMBED": lambda: os.environ.get("VLLM_OMNI_CACHE_PROMPT_EMBED", "0") == "1",
 }
 
 

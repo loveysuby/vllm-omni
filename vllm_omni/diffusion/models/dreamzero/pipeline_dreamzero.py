@@ -3,7 +3,7 @@
 
 """DreamZero pipeline for vllm-omni.
 
-Entry point for DiffusionEngine.step() → pipeline.forward(req)
+Entry point for DiffusionEngine.step() -> pipeline.forward(req)
 """
 
 from __future__ import annotations
@@ -54,8 +54,7 @@ from vllm_omni.diffusion.models.dreamzero.utils import (
     DEFAULT_SIGMA_SHIFT,
 )
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
-from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.platforms import current_omni_platform
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
@@ -73,14 +72,9 @@ MAX_DREAMZERO_SESSIONS = 64
 _HOSTPROF_ENABLED = os.environ.get("DREAMZERO_PROFILE_HOST", "0") == "1"
 _HOSTPROF_NVTX = _HOSTPROF_ENABLED and torch.cuda.is_available()
 
-# Host-side optimizations, each opt-in via its own env flag (vllm_omni/diffusion/envs.py).
-# When a flag is off, that code path is byte-identical to the baseline.
+# Host-side optimization, opt-in via its env flag (vllm_omni/diffusion/envs.py).
+# When the flag is off, that code path is byte-identical to the baseline.
 _SCHEDULER_FRESH_BUILD = envs.VLLM_OMNI_SCHEDULER_FRESH_BUILD
-_CACHE_NEG_PROMPT_EMBED = envs.VLLM_OMNI_CACHE_NEG_PROMPT_EMBED
-_CACHE_PROMPT_EMBED = envs.VLLM_OMNI_CACHE_PROMPT_EMBED
-# Max distinct prompts cached by the positive-prompt encode LRU.
-# A closed-loop session usually keeps one task prompt; a few covers prompt switches.
-_POS_CACHE_MAX = 4
 
 
 def _hostprof_tic() -> float | None:
@@ -147,17 +141,102 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
     Multi-output: predict_noise() returns (video_pred, action_pred).
     CFG: video gets standard CFG, action takes positive branch only.
-    State: DreamZeroState manages KV cache + frame buffer across forward() calls.
+
+    KV is managed by the AR-Diffusion engine: ``self._ar_diffusion_kv_state`` is set by the
+    runner before ``forward()`` and the pipeline routes all KV access (get / update /
+    commit / reset) through the pool-backed state. Purely duck-typed (no engine import).
     """
+
+    _ar_diffusion_kv_state = None  # set by the runner before each forward
+
+    def _kv_get(self, state, is_negative, seq_len=None, update_kv_cache=False):
+        return self._ar_diffusion_kv_state.get_kv_caches(
+            is_negative,
+            seq_len=seq_len,
+            commit_current=update_kv_cache,
+        )
+
+    def _kv_create(self, state, batch_size, dtype, device, num_layers, num_heads, head_dim):
+        # The engine owns all KV allocation: self-attn is allocated lazily from
+        # paged contexts, and cross-attn is populated eagerly in _kv_populate_cross.
+        # Nothing is created model-side.
+        return
+
+    def _kv_commit(self, is_negative: bool):
+        self._ar_diffusion_kv_state.commit_paged_context(is_negative)
+
+    def _kv_get_cross(self, state, is_negative):
+        """Cross-attn cache from the engine pool (text k/v + I2V image k_img/v_img)."""
+        return self._ar_diffusion_kv_state.get_cross_kv_caches(is_negative)
+
+    def _kv_populate_cross(self, context: torch.Tensor, clip_feature, is_negative: bool) -> None:
+        """Eagerly project cross-attn K/V for all layers into the AR-Diffusion pool.
+
+        Caches the session-invariant cross-attn projections once, per half: the text
+        ``k``/``v`` from ``text_embedding(context)`` survive window-boundary resets
+        (prompt unchanged within a session — only session resets clear them), while
+        the I2V image-token ``k_img``/``v_img`` from ``img_emb(clip_feature)`` (the
+        257 image tokens the forward splits off, cached model-side by #4154) are
+        re-projected on every window restart from the fresh CLIP features. Must run
+        after the image is encoded so ``clip_feature`` is available.
+        """
+        s = self._ar_diffusion_kv_state
+        need_text = not s._cross_text_populated.get(is_negative, False)
+        need_img = (
+            clip_feature is not None
+            and getattr(self.transformer, "model_type", "t2v") == "i2v"
+            and not s._cross_img_populated.get(is_negative, False)
+        )
+        if not need_text and not need_img:
+            return
+        projected = self.transformer.text_embedding(context) if need_text else None
+        img_ctx = self.transformer.img_emb(clip_feature) if need_img else None
+        for i, block in enumerate(self.transformer.blocks):
+            ca = block.cross_attn
+            n, d = ca.tp_num_heads, ca.head_dim
+            k = v = None
+            if projected is not None:
+                k = ca.norm_k(ca.k(projected)).unflatten(2, (n, d))
+                v = ca.v(projected).unflatten(2, (n, d))
+            k_img = v_img = None
+            if img_ctx is not None:
+                k_img = ca.norm_k_img(ca.k_img(img_ctx)).unflatten(2, (n, d))
+                v_img = ca.v_img(img_ctx).unflatten(2, (n, d))
+            s.kv_cache.write_cross_kv(i, is_negative, k, v, k_img, v_img)
+        if need_text:
+            s._cross_text_populated[is_negative] = True
+        if need_img:
+            s._cross_img_populated[is_negative] = True
+        logger.info(
+            "AR-Diffusion CROSS POPULATE [%s]: %d layers, text=%s img=%s",
+            "neg" if is_negative else "pos",
+            len(self.transformer.blocks),
+            "kept" if projected is None else tuple(context.shape),
+            None if img_ctx is None else tuple(img_ctx.shape),
+        )
+
+    def _kv_reset(self, state, *, clear_video_latents: bool = True):
+        """Reset the engine's pooled session window plus the model's non-KV state.
+
+        DreamZero resets at the attention-window boundary; the engine pool drops the
+        same window so the next forward starts fresh. ``clear_video_latents=False``
+        keeps the accumulated video latents for export.
+
+        ``clear_video_latents=False`` also marks a window ("inference") reset: the
+        prompt is unchanged, so the pool keeps the text cross-attn K/V and only the
+        image half repopulates on the restart forward.
+        """
+        state.reset(clear_video_latents=clear_video_latents)
+        self._ar_diffusion_kv_state.reset(keep_cross_text=not clear_video_latents)
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         """Initialize pipeline components.
 
         DreamZero root checkpoint layout (GEAR-Dreams/DreamZero-DROID):
-          config.json                     — root config (action_head_cfg, architectures, etc.)
-          model-*.safetensors             — all learned weights (action_head.{model,text_encoder,image_encoder,vae}.*)
-          experiment_cfg/metadata.json    — per-embodiment action normalization stats
-          vae/                            — symlink to Wan2.1 VAE (diffusers-compatible)
+          config.json                     -- root config (action_head_cfg, architectures, etc.)
+          model-*.safetensors             -- all learned weights (action_head.{model,text_encoder,image_encoder,vae}.*)
+          experiment_cfg/metadata.json    -- per-embodiment action normalization stats
+          vae/                            -- symlink to Wan2.1 VAE (diffusers-compatible)
 
         Components are instantiated from config (not from_pretrained), then filled
         by load_weights() which reads root safetensors and remaps key prefixes.
@@ -171,6 +250,18 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
           `load_weights()`
         """
         super().__init__()
+
+        # DreamZero is engine-only: every KV access in forward() routes through
+        # the AR-Diffusion engine's pool-backed state. Fail fast here — a stale
+        # or programmatic config that leaves engine_backend="default" would
+        # otherwise only crash mid-forward on the first KV access.
+        engine_backend = str(getattr(od_config, "engine_backend", "") or "")
+        if "ar_diffusion" not in engine_backend.lower().replace("-", "_"):
+            raise ValueError(
+                "DreamZeroPipeline requires the AR-Diffusion engine; set "
+                "engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine "
+                f"in the deploy config (got engine_backend={engine_backend!r})."
+            )
 
         model_path = od_config.model
         model_config = od_config.model_config
@@ -278,8 +369,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self.max_action_dim: int = ah_config["max_action_dim"]
 
         self.negative_prompt: str = model_config.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
+        # The negative prompt is a model constant: encode it once, lazily, and
+        # reuse across every forward/session (UMT5 encode is deterministic).
+        self._negative_prompt_embeds_cache: torch.Tensor | None = None
 
-        # Embodiment name → numeric ID mapping (model knowledge)
+        # Embodiment name -> numeric ID mapping (model knowledge)
         self.embodiment_name_to_id: dict[str, int] = model_config.get(
             "embodiment_name_to_id",
             DEFAULT_EMBODIMENT_NAME_TO_ID,
@@ -394,11 +488,17 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             state=kwargs.get("state_features"),
             embodiment_id=kwargs.get("embodiment_id"),
         )
-        if kwargs.get("update_kv_cache", False) and updated_kv_caches:
-            state = kwargs.get("dreamzero_state", self.state)
+        if kwargs.get("update_kv_cache", False):
             is_neg = kwargs.get("is_negative", False)
-            for i, kv in enumerate(updated_kv_caches):
-                state.update_kv_cache(i, kv, is_negative=is_neg)
+            logger.debug(
+                "AR-Diffusion pipeline predict_noise -> commit paged context: "
+                "is_neg=%s seq_len=%s current_start_frame=%s layers=%d",
+                is_neg,
+                kwargs.get("seq_len"),
+                kwargs.get("current_start_frame"),
+                len(updated_kv_caches),
+            )
+            self._kv_commit(is_neg)
 
         return video_pred, action_pred
 
@@ -412,6 +512,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         Paper D.2 uses ``mode=reduce-overhead``, ``fullgraph=True``, ``dynamic=False``
         on text/image/VAE and DiT. VAE decode uses a tensor feat_cache patch and
         compiles ``decoder.forward`` (not ``_decode``, which has a Python frame loop).
+        Incremental VAE encode (``_vae_encode_encoder_chunk``) stays eager because
+        Wan ``feat_cache`` mutation is incompatible with CUDAGraph capture.
         DiT blocks use per-block ``fullgraph=True``.
         """
         if not torch.cuda.is_available():
@@ -426,6 +528,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         compile_ro = {"mode": "reduce-overhead", "fullgraph": True, "dynamic": False}
         # DiT blocks: default avoids CUDAGraph overwrite on modulation tensors; encoders use reduce-overhead.
+        # The AR-Diffusion paged self-attention is a registered custom op, so the
+        # block stays fullgraph even on that path.
         dit_compile = {"mode": "default", "fullgraph": True, "dynamic": False}
 
         logger.info(
@@ -446,9 +550,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             logger.warning("DreamZero: image_encoder compile failed (%s); skipping.", exc)
 
         try:
-            self.vae.encode = torch.compile(self.vae.encode, **compile_ro)
+            self.vae._encode = torch.compile(self.vae._encode, **compile_ro)
         except Exception as exc:
-            logger.warning("DreamZero: vae.encode compile failed (%s); skipping.", exc)
+            logger.warning("DreamZero: vae._encode compile failed (%s); skipping.", exc)
 
         compiled_blocks = 0
         for block in self.transformer.blocks:
@@ -487,9 +591,23 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
             try:
                 image = torch.zeros(1, 1, 3, 180, 320, dtype=torch.bfloat16, device=device)
-                self._encode_image(image, self.num_frames, 180, 320)
+                self._encode_image(image, self.num_frames, 180, 320, state=self.state)
             except Exception as exc:
                 logger.warning("DreamZero compile warmup (image_encoder) skipped: %s", exc)
+
+            try:
+                self.state.reset_vae_encoder_stream()
+                dummy_video = torch.zeros(1, 3, 1, 180, 320, dtype=torch.bfloat16, device=device)
+                self._vae_stream_seed(self.state, dummy_video[:, :, :1])
+                for _ in range(4):
+                    self._vae_stream_append_frame(self.state, dummy_video[:, :, :1])
+                self._vae_stream_get_observation_latents(
+                    self.state,
+                    self.num_frame_per_block,
+                    dtype=torch.bfloat16,
+                )
+            except Exception as exc:
+                logger.warning("DreamZero compile warmup (vae encode stream) skipped: %s", exc)
 
             try:
                 latent_h, latent_w = 180 // 8, 320 // 8
@@ -536,10 +654,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         latents: tuple[torch.Tensor, torch.Tensor],
         do_true_cfg: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Post-step sync: .contiguous() + platform synchronize."""
+        """Post-step sync: .contiguous() + cuda.synchronize()"""
         latents = tuple(t.contiguous() for t in latents)
         if do_true_cfg and get_classifier_free_guidance_world_size() > 1:
-            current_omni_platform.synchronize()
+            device = next((t.device for t in latents if t.is_cuda), None)
+            if device is not None:
+                torch.cuda.current_stream(device).synchronize()
         return latents
 
     # -----------------------------------------------------------------------
@@ -547,7 +667,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     # -----------------------------------------------------------------------
 
     def _preprocess_video(self, videos: torch.Tensor) -> torch.Tensor:
-        """uint8 [B,T,H,W,C] → bfloat16 [B,C,T,H,W] normalized to [-1,1]."""
+        """uint8 [B,T,H,W,C] -> bfloat16 [B,C,T,H,W] normalized to [-1,1]."""
         videos = videos.permute(0, 4, 1, 2, 3)
         if videos.dtype == torch.uint8:
             videos = videos.float() / 255.0
@@ -626,98 +746,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             return self._make_scheduler()
         return copy.deepcopy(self.scheduler)
 
-    def _encode_negative_prompt(self, device: torch.device) -> torch.Tensor:
-        """Encode the constant negative prompt for the CFG uncond branch.
-
-        ``self.negative_prompt`` is a model constant, so the tokenize + UMT5
-        encode produces the same embeds every step. With W7 host-opt
-        (``VLLM_OMNI_CACHE_NEG_PROMPT_EMBED=1``) it is computed once and reused per device;
-        when off this is exactly the original per-call path.
-
-        bitwise-safe: identical constant input -> identical tokens -> identical
-        UMT5 eval forward -> identical embeds. Downstream cross-attention treats
-        the embeds as read-only (encoder_hidden_states), so reusing the cached
-        tensor does not change the math. This is pure constant-folding of a
-        deterministic pure function, verified in-process by
-        ``tests/dreamzero/test_neg_embed_cache_equiv.py`` (cached == recomputed,
-        byte-identical, device-keyed). NB: an end-to-end on/off output digest does
-        NOT verify this -- the GPU forward is not bitwise-reproducible run-to-run
-        (bf16 + flash-attn + CUDA graph), so the flag is invisible against kernel
-        noise; the contract is established structurally, not by output diffing.
-        """
-        if _CACHE_NEG_PROMPT_EMBED:
-            cached = getattr(self, "_neg_embed_cache", None)
-            if cached is not None and cached[0] == device:
-                return cached[1]
-        neg_inputs = self.tokenizer(
-            self.negative_prompt,
-            max_length=512,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-            add_special_tokens=True,
-        )
-        neg_embeds = self._encode_text(
-            neg_inputs["input_ids"].to(device),
-            neg_inputs["attention_mask"].to(device),
-        )
-        if _CACHE_NEG_PROMPT_EMBED:
-            self._neg_embed_cache = (device, neg_embeds)
-        return neg_embeds
-
-    def _encode_positive_prompt(
-        self, prompt_str: str, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Tokenize + UMT5-encode the task prompt for the CFG cond branch.
-
-        Within a closed-loop session the task prompt is constant across steps, so
-        the tokenize + UMT5 forward (``encode_text_pos`` ~28ms, p99 221ms) is
-        recomputed redundantly every step. With W7 host-opt
-        (``VLLM_OMNI_CACHE_PROMPT_EMBED=1``) the ``(text_tokens, attention_mask,
-        prompt_embeds)`` triple is cached per ``(prompt_str, device)`` in a small
-        LRU; a hit skips both the tokenizer and the UMT5 forward. When off this is
-        exactly the original per-step path (tokenize then encode), just folded
-        into one call.
-
-        Returns ``(text_tokens, attention_mask, prompt_embeds)`` -- the tokens and
-        mask are returned too because the reset logic and ``state.language`` need
-        the same tokens (so a hit also avoids re-tokenizing).
-
-        bitwise-safe: identical ``prompt_str`` -> identical tokens (deterministic
-        tokenizer) -> identical UMT5 eval forward -> identical embeds; downstream
-        cross-attention treats the embeds as read-only. This is pure
-        constant-folding of a deterministic pure function, verified in-process by
-        ``tests/dreamzero/test_pos_embed_cache_equiv.py``. As with the neg cache,
-        an end-to-end on/off output digest does NOT verify this -- the GPU forward
-        is not bitwise-reproducible run-to-run.
-        """
-        if _CACHE_PROMPT_EMBED:
-            cache = getattr(self, "_pos_cache", None)
-            if cache is None:
-                cache = self._pos_cache = OrderedDict()
-            key = (prompt_str, device)
-            hit = cache.get(key)
-            if hit is not None:
-                cache.move_to_end(key)
-                return hit
-        text_inputs = self.tokenizer(
-            prompt_str,
-            max_length=512,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-            add_special_tokens=True,
-        )
-        text_tokens = text_inputs["input_ids"].to(device)
-        attention_mask = text_inputs["attention_mask"].to(device)
-        prompt_embeds = self._encode_text(text_tokens, attention_mask)
-        result = (text_tokens, attention_mask, prompt_embeds)
-        if _CACHE_PROMPT_EMBED:
-            cache[key] = result
-            if len(cache) > _POS_CACHE_MAX:
-                cache.popitem(last=False)
-        return result
-
     # -----------------------------------------------------------------------
     # Image encoding
     # -----------------------------------------------------------------------
@@ -728,6 +756,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         num_frames: int,
         height: int,
         width: int,
+        *,
+        state: DreamZeroState | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode first frame via CLIP + VAE.
         Returns: (clip_feas, ys, image_latent)
@@ -763,11 +793,147 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             new_image = y[:, :, 0:1]
             y = torch.concat([msk, y], dim=1)
 
+            if state is not None:
+                if not state.vae_stream_initialized:
+                    # Seed the AR streaming encoder after the compiled full encode above;
+                    # ``cudagraph_mark_step_begin`` isolates eager feat_cache work from CUDAGraph.
+                    self._vae_stream_seed(state, image_input[:, :, :1])
+                else:
+                    # Window ("inference") restart with a live stream: keep the real
+                    # frame history in the Wan feat_cache and append the restart
+                    # observation instead of reseeding from scratch.
+                    self._cudagraph_mark_step_begin()
+                    self._vae_stream_append_frame(state, image_input[:, :, :1])
+
         return clip_context, y, new_image
+
+    def _vae_patchify(self, videos: torch.Tensor) -> torch.Tensor:
+        if self.vae.config.patch_size is not None:
+            from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
+
+            return patchify(videos, patch_size=self.vae.config.patch_size)
+        return videos
+
+    @staticmethod
+    def _vae_clone_feat_map(feat_map: list[torch.Tensor | None]) -> list[torch.Tensor | None]:
+        return [entry.clone() if isinstance(entry, torch.Tensor) else entry for entry in feat_map]
+
+    def _vae_init_enc_feat_map(self) -> list[torch.Tensor | None]:
+        self.vae.clear_cache()
+        return self._vae_clone_feat_map(self.vae._enc_feat_map)
+
+    def _vae_encode_encoder_chunk(
+        self,
+        chunk: torch.Tensor,
+        feat_map: list[torch.Tensor | None],
+    ) -> tuple[torch.Tensor, list[torch.Tensor | None]]:
+        """Run one Wan encoder chunk while mutating ``feat_map`` in place.
+
+        Must stay eager (not ``torch.compile``): Wan causal ``feat_cache`` updates
+        conflict with ``reduce-overhead`` CUDAGraph capture.
+        """
+        self.vae._enc_feat_map = feat_map
+        self.vae._enc_conv_idx = [0]
+        out = self.vae.encoder(
+            chunk,
+            feat_cache=self.vae._enc_feat_map,
+            feat_idx=self.vae._enc_conv_idx,
+        )
+        return out, self._vae_clone_feat_map(self.vae._enc_feat_map)
+
+    def _vae_quantize_encoder_out(self, encoder_out: torch.Tensor) -> torch.Tensor:
+        enc = self.vae.quant_conv(encoder_out)
+        mu, _ = enc.chunk(2, dim=1)
+        mean = self.vae_latents_mean.to(device=mu.device, dtype=mu.dtype)
+        inv_std = self.vae_latents_inv_std.to(device=mu.device, dtype=mu.dtype)
+        return (mu - mean) * inv_std
+
+    def _vae_stream_seed(self, state: DreamZeroState, first_frame: torch.Tensor) -> None:
+        """Seed incremental VAE encode with the first observation frame."""
+        state.reset_vae_encoder_stream()
+        feat_map = self._vae_init_enc_feat_map()
+        chunk = self._vae_patchify(first_frame.to(dtype=self.vae.dtype))
+        self._cudagraph_mark_step_begin()
+        encoder_out, feat_map = self._vae_encode_encoder_chunk(chunk[:, :, :1], feat_map)
+        state.vae_enc_feat_map = feat_map
+        state.vae_encoder_out = encoder_out
+        state.vae_pending_body_frames = None
+        state.vae_stream_initialized = True
+
+    def _vae_stream_append_frame(self, state: DreamZeroState, new_frame: torch.Tensor) -> None:
+        """Append one pixel frame and encode a 4-frame body chunk when ready."""
+        if not state.vae_stream_initialized or state.vae_enc_feat_map is None or state.vae_encoder_out is None:
+            raise RuntimeError("VAE encoder stream is not initialized.")
+
+        frame = new_frame.to(dtype=self.vae.dtype)
+        if state.vae_pending_body_frames is None:
+            state.vae_pending_body_frames = frame
+        else:
+            state.vae_pending_body_frames = torch.cat([state.vae_pending_body_frames, frame], dim=2)
+
+        while state.vae_pending_body_frames is not None and state.vae_pending_body_frames.shape[2] >= 4:
+            body = state.vae_pending_body_frames[:, :, :4]
+            if state.vae_pending_body_frames.shape[2] > 4:
+                state.vae_pending_body_frames = state.vae_pending_body_frames[:, :, 4:]
+            else:
+                state.vae_pending_body_frames = None
+            chunk = self._vae_patchify(body)
+            encoder_chunk, feat_map = self._vae_encode_encoder_chunk(chunk, state.vae_enc_feat_map)
+            state.vae_encoder_out = torch.cat([state.vae_encoder_out, encoder_chunk], dim=2)
+            state.vae_enc_feat_map = feat_map
+
+    def _vae_stream_get_observation_latents(
+        self,
+        state: DreamZeroState,
+        num_latent_frames: int,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if state.vae_encoder_out is None:
+            raise RuntimeError("VAE encoder stream has no accumulated encoder output.")
+        latents = self._vae_quantize_encoder_out(state.vae_encoder_out).to(dtype=dtype)
+        if latents.shape[2] >= num_latent_frames:
+            return latents[:, :, -num_latent_frames:]
+        pad_count = num_latent_frames - latents.shape[2]
+        pad = latents[:, :, -1:].expand(-1, -1, pad_count, -1, -1)
+        return torch.cat([pad, latents], dim=2)
+
+    def _preprocess_vae_observation_window(self, videos: torch.Tensor) -> torch.Tensor:
+        _, _, num_frames_raw, _, _ = videos.shape
+        if (num_frames_raw - 1) // 4 == self.num_frame_per_block:
+            return videos
+        if num_frames_raw // 4 != self.num_frame_per_block:
+            repeat_factor = self.num_frame_per_block // (num_frames_raw // 4)
+            videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
+            first_frame = videos[:, :, 0:1]
+            return torch.cat([first_frame, videos], dim=2)
+        first_frame = videos[:, :, 0:1]
+        return torch.cat([first_frame, videos], dim=2)
+
+    def _encode_observation_latents(
+        self,
+        state: DreamZeroState,
+        videos: torch.Tensor,
+        *,
+        latent_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Encode current robot observation into normalized VAE latents."""
+        if state.vae_stream_initialized:
+            self._cudagraph_mark_step_begin()
+            self._vae_stream_append_frame(state, videos[:, :, -1:])
+            return self._vae_stream_get_observation_latents(
+                state,
+                self.num_frame_per_block,
+                dtype=latent_dtype,
+            )
+
+        videos = self._preprocess_vae_observation_window(videos)
+        return self._encode_vae_latents(videos).to(dtype=latent_dtype)
 
     def _encode_vae_latents(self, videos: torch.Tensor) -> torch.Tensor:
         """Encode videos into normalized VAE latents."""
         input_dtype = videos.dtype
+        self._cudagraph_mark_step_begin()
         hidden = self.vae._encode(videos.to(dtype=self.vae.dtype))
         mu, _ = hidden.chunk(2, dim=1)
         mean = self.vae_latents_mean.to(device=mu.device, dtype=mu.dtype)
@@ -817,7 +983,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     ) -> None:
         """Prefill KV cache with first frame and/or current observation.
 
-        Uses predict_noise_maybe_with_cfg() for CFG parallel — same path as
+        Uses predict_noise_maybe_with_cfg() for CFG parallel -- same path as
         the denoise loop. The mixin handles rank dispatch automatically.
         KV cache update happens as a side effect inside predict_noise().
         """
@@ -828,7 +994,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         head_dim = self.transformer.dim // self.transformer.num_heads
 
         if state.current_start_frame == 0:
-            state.create_kv_caches(
+            self._kv_create(
+                state,
                 batch_size,
                 dtype,
                 device,
@@ -853,16 +1020,16 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
             positive_kwargs = dict(
                 encoder_hidden_states=prompt_embeds,
-                kv_cache=state.get_kv_caches(False),
-                crossattn_cache=state.get_crossattn_caches(False),
+                kv_cache=self._kv_get(state, False, seq_len=frame_seqlen, update_kv_cache=True),
+                crossattn_cache=self._kv_get_cross(state, False),
                 is_negative=False,
                 **common,
             )
             negative_kwargs = (
                 dict(
                     encoder_hidden_states=negative_prompt_embeds,
-                    kv_cache=state.get_kv_caches(True),
-                    crossattn_cache=state.get_crossattn_caches(True),
+                    kv_cache=self._kv_get(state, True, seq_len=frame_seqlen, update_kv_cache=True),
+                    crossattn_cache=self._kv_get_cross(state, True),
                     is_negative=True,
                     **common,
                 )
@@ -903,16 +1070,16 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
             positive_kwargs = dict(
                 encoder_hidden_states=prompt_embeds,
-                kv_cache=state.get_kv_caches(False),
-                crossattn_cache=state.get_crossattn_caches(False),
+                kv_cache=self._kv_get(state, False, seq_len=seq_len, update_kv_cache=True),
+                crossattn_cache=self._kv_get_cross(state, False),
                 is_negative=False,
                 **common,
             )
             negative_kwargs = (
                 dict(
                     encoder_hidden_states=negative_prompt_embeds,
-                    kv_cache=state.get_kv_caches(True),
-                    crossattn_cache=state.get_crossattn_caches(True),
+                    kv_cache=self._kv_get(state, True, seq_len=seq_len, update_kv_cache=True),
+                    crossattn_cache=self._kv_get_cross(state, True),
                     is_negative=True,
                     **common,
                 )
@@ -945,8 +1112,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         For each timestep:
           1. Build positive_kwargs / negative_kwargs
-          2. predict_noise_maybe_with_cfg()    → (video_pred, action_pred)
-          3. scheduler_step_maybe_with_cfg()   → VideoActionScheduler
+          2. predict_noise_maybe_with_cfg()    -> (video_pred, action_pred)
+          3. scheduler_step_maybe_with_cfg()   -> VideoActionScheduler
           4. _synchronize_cfg_parallel_step_output()
         """
         seq_len = kwargs["seq_len"]
@@ -1005,8 +1172,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     hidden_states=noisy_input.transpose(1, 2),
                     timestep_video=timestep,
                     encoder_hidden_states=prompt_embeds,
-                    kv_cache=state.get_kv_caches(False),
-                    crossattn_cache=state.get_crossattn_caches(False),
+                    kv_cache=self._kv_get(state, False, seq_len=seq_len, update_kv_cache=False),
+                    crossattn_cache=self._kv_get_cross(state, False),
                     y=y,
                     clip_feature=state.clip_feas,
                     action=noisy_input_action,
@@ -1020,8 +1187,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                         hidden_states=noisy_input.transpose(1, 2),
                         timestep_video=timestep,
                         encoder_hidden_states=negative_prompt_embeds,
-                        kv_cache=state.get_kv_caches(True),
-                        crossattn_cache=state.get_crossattn_caches(True),
+                        kv_cache=self._kv_get(state, True, seq_len=seq_len, update_kv_cache=False),
+                        crossattn_cache=self._kv_get_cross(state, True),
                         y=y,
                         clip_feature=state.clip_feas,
                         action=noisy_input_action,
@@ -1081,7 +1248,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         return transform, transform.transform_input(robot_obs)
 
     @torch.no_grad()
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
         """Full inference step. Called by DiffusionEngine.step()."""
         extra_args = req.sampling_params.extra_args or {}
         robot_obs = extra_args.get("robot_obs")
@@ -1123,7 +1290,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             device=device,
         )
 
-        # State: raw from transform → pad to (B, state_horizon=1, max_state_dim)
+        # State: raw from transform -> pad to (B, state_horizon=1, max_state_dim)
         raw_state = unified_obs["state"]
         state_for_postprocess = None
         if raw_state is not None:
@@ -1148,53 +1315,100 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         else:
             state_features = None
 
-        # ---- Step 1b: Tokenize + encode prompt ----
-        # (wan2_2 convention: pipeline owns tokenizer.) W7 P2-a folds tokenize +
-        # UMT5 encode into one cached call: the task prompt is constant within a
-        # session, so the encode is moved up and reused. Safe to compute the
-        # embeds here -- they depend only on (tokens, mask, text_encoder weights),
-        # none of which the intervening reset/frame-accumulate logic touches.
-        _hostprof_push("encode_text_pos")
+        # ---- Step 1b: Tokenize ---- (wan2_2 convention: pipeline owns tokenizer.)
+        # Tokens are needed up front for the reset decision + state.language; the
+        # UMT5 encode is deferred to the text-encode section below, where it is
+        # cached on state.prompt_embeds.
+        _hostprof_push("tokenize_pos")
         _hostprof_t = _hostprof_tic()
-        text_tokens, attention_mask, prompt_embeds = self._encode_positive_prompt(prompt_str, device)
-        _hostprof_toc("encode_text_pos", _hostprof_t, host_timings)
+        text_inputs = self.tokenizer(
+            prompt_str,
+            max_length=512,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+        text_tokens = text_inputs["input_ids"].to(device)
+        attention_mask = text_inputs["attention_mask"].to(device)
+        _hostprof_toc("tokenize_pos", _hostprof_t, host_timings)
         _hostprof_pop()
 
         # Explicit reset from OpenPI serving is carried by `extra_args["reset"]`
         # on the next inference request after websocket reset/session switch.
         if extra_args.get("reset", False):
-            state.reset()
+            self._kv_reset(state)
         else:
-            # Auto-reset based on model state (before accumulation).
-            # main(#4213) replaced should_reset(bool) with reset_reason
-            # (session / inference); keep that semantics, just time the call.
+            # Auto-reset based on model state (before accumulation). Both a "session"
+            # reset and an "inference" (window-boundary) reset clear the model-local
+            # KV window, so route both through _kv_reset to drop the AR-Diffusion pool window
+            # too and stay parity-exact; "inference" keeps the accumulated video
+            # latents (reset_inference_state == reset(clear_video_latents=False)).
             _hostprof_push("reset_reason")
             _hostprof_t = _hostprof_tic()
             reset_reason = state.reset_reason(text_tokens, 0, self.transformer.local_attn_size)
             _hostprof_toc("reset_reason", _hostprof_t, host_timings)
             _hostprof_pop()
             if reset_reason == "session":
-                state.reset()
+                self._kv_reset(state)
             elif reset_reason == "inference":
-                state.reset_inference_state()
+                self._kv_reset(state, clear_video_latents=False)
         state.language = text_tokens
 
-        # Frame accumulation: stitched single frame → multi-frame video
+        # Frame accumulation: stitched single frame -> multi-frame video
         video_frames = state.accumulate_frames(stitched)  # (T, H, W, C)
         videos = torch.from_numpy(video_frames).unsqueeze(0).to(device)  # (B=1, T, H, W, C)
 
-        videos = self._preprocess_video(videos)  # → [B,C,T,H,W] bf16
+        videos = self._preprocess_video(videos)  # -> [B,C,T,H,W] bf16
         _, _, num_frames_raw, height, width = videos.shape
 
-        # (prompt_embeds computed above via _encode_positive_prompt)
+        # Optional phase timing (DZ_PHASE_TIMING=1): logs per-forward stage costs
+        # (text encode / obs VAE encode / KV prefill / denoise) at INFO. Each mark
+        # synchronizes CUDA, so leave it off for timed benchmark runs.
+        _pt = None
+        if os.environ.get("DZ_PHASE_TIMING"):
+            import time as _time
+
+            torch.accelerator.synchronize()
+            _pt = {"time": _time, "t0": _time.perf_counter(), "marks": []}
+
+        def _pt_mark(name: str) -> None:
+            if _pt is not None:
+                torch.accelerator.synchronize()
+                _pt["marks"].append((name, _pt["time"].perf_counter()))
+
+        # Prompt embeds are constant within a session (a prompt change triggers a
+        # "session" reset above, which clears this cache alongside state.language).
+        _hostprof_push("encode_text_pos")
+        _hostprof_t = _hostprof_tic()
+        if state.prompt_embeds is None:
+            state.prompt_embeds = self._encode_text(text_tokens, attention_mask)
+        prompt_embeds = state.prompt_embeds
+        _hostprof_toc("encode_text_pos", _hostprof_t, host_timings)
+        _hostprof_pop()
         # Negative prompt for CFG uncond branch (model constant)
         negative_prompt_embeds = None
         if self.cfg_scale > 1.0:
             _hostprof_push("neg_embed")
             _hostprof_t = _hostprof_tic()
-            negative_prompt_embeds = self._encode_negative_prompt(device)
+            if self._negative_prompt_embeds_cache is None:
+                neg_inputs = self.tokenizer(
+                    self.negative_prompt,
+                    max_length=512,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt",
+                    add_special_tokens=True,
+                )
+                self._negative_prompt_embeds_cache = self._encode_text(
+                    neg_inputs["input_ids"].to(device),
+                    neg_inputs["attention_mask"].to(device),
+                )
+            negative_prompt_embeds = self._negative_prompt_embeds_cache
             _hostprof_toc("neg_embed", _hostprof_t, host_timings)
             _hostprof_pop()
+
+        _pt_mark("text_encode")
 
         # Extract first/last frame for CLIP + VAE encoding
         if num_frames_raw == 4 or num_frames_raw == 9:
@@ -1208,27 +1422,24 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 self.num_frames,
                 height,
                 width,
+                state=state,
             )
             state.clip_feas = clip_feas.to(dtype=image.dtype)
             state.ys = ys.to(dtype=image.dtype)
 
-        if state.current_start_frame != 0:
-            # Subsequent calls: encode current observation via VAE
-            if (num_frames_raw - 1) // 4 == self.num_frame_per_block:
-                pass
-            elif num_frames_raw // 4 != self.num_frame_per_block:
-                repeat_factor = self.num_frame_per_block // (num_frames_raw // 4)
-                videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
-                first_frame = videos[:, :, 0:1]
-                videos = torch.cat([first_frame, videos], dim=2)
-            else:
-                first_frame = videos[:, :, 0:1]
-                videos = torch.cat([first_frame, videos], dim=2)
+            # Eager cross-attn population (AR-Diffusion only): cache text + image-token K/V
+            # into the pool now that the image is encoded (clip_feas available).
+            # Runs on the first forward of a session and after each window-boundary
+            # reset (current_start_frame returns to 0); the populate guards (text/img halves) gate re-entry.
+            self._kv_populate_cross(prompt_embeds, state.clip_feas, is_negative=False)
+            if negative_prompt_embeds is not None:
+                self._kv_populate_cross(negative_prompt_embeds, state.clip_feas, is_negative=True)
 
+        if state.current_start_frame != 0:
             latent_dtype = videos.dtype
             with torch.no_grad():
-                image = self._encode_vae_latents(videos)
-            image = image.to(dtype=latent_dtype)
+                image = self._encode_observation_latents(state, videos, latent_dtype=latent_dtype)
+        _pt_mark("obs_vae_encode")
 
         batch_size = image.shape[0]
         generator = torch.Generator(device=device).manual_seed(self.seed)
@@ -1273,6 +1484,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
         _hostprof_toc("prefill_kv", _hostprof_t, host_timings)
         _hostprof_pop()
+        _pt_mark("prefill_kv")
 
         _hostprof_push("sched_deepcopy")
         _hostprof_t = _hostprof_tic()
@@ -1322,6 +1534,19 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         )
         _hostprof_toc("diffuse", _hostprof_t, host_timings)
         _hostprof_pop()
+        if _pt is not None:
+            _pt_mark("diffuse")
+            prev_t = _pt["t0"]
+            parts = []
+            for name, t in _pt["marks"]:
+                parts.append(f"{name}={1000 * (t - prev_t):.1f}ms")
+                prev_t = t
+            logger.info(
+                "DZ_PHASE_TIMING csf=%s total=%.1fms %s",
+                state.current_start_frame,
+                1000 * (prev_t - _pt["t0"]),
+                " ".join(parts),
+            )
 
         if state.current_start_frame == 1:
             video_out = torch.cat([image, video_out], dim=1)
@@ -1332,7 +1557,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # q99 denorm: [-1,1] → real values
         action_out = self._denormalize_action(action_out.float(), embodiment_name)
 
-        # Relative → absolute: only for relative_action_keys (joint_position only)
+        # Relative -> absolute: only for relative_action_keys (joint_position only)
         # gripper_position is NOT relative, so don't add state back to it
         if self.relative_action and state_for_postprocess is not None:
             n_relative = self.relative_action_dim  # 7 for DROID (joint only)
@@ -1344,7 +1569,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 action_out[..., :n_relative] + last_state.unsqueeze(1)  # broadcast over horizon
             )
 
-        # Squeeze batch dim for output: (B, horizon, dim) → (horizon, dim)
+        # Squeeze batch dim for output: (B, horizon, dim) -> (horizon, dim)
         _hostprof_push("action_d2h")
         _hostprof_t = _hostprof_tic()
         actions_np = action_out.squeeze(0).float().cpu().numpy()  # (horizon, max_action_dim)
@@ -1455,7 +1680,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         q01 = stats["q01"].to(device=action.device, dtype=action.dtype)
         q99 = stats["q99"].to(device=action.device, dtype=action.dtype)
         # action shape: (B, horizon, action_dim) or (B, horizon, max_action_dim)
-        # q01/q99 shape: (actual_action_dim,) — only denorm actual dims
+        # q01/q99 shape: (actual_action_dim,) -- only denorm actual dims
         actual_dim = q01.shape[0]
         action_real = action.clone()
         action_real[..., :actual_dim] = (action[..., :actual_dim] + 1) / 2 * (q99 - q01) + q01
