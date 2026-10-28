@@ -64,6 +64,8 @@ def _group_norm_silu_kernel(
     split_chunk,
     num_groups: tl.constexpr,
     eps: tl.constexpr,
+    # Round the normalized value to the output dtype before SiLU
+    ROUND_NORM: tl.constexpr,
     # Split reduction
     SPLIT: tl.constexpr,
     SPLIT_POW2: tl.constexpr,
@@ -129,6 +131,10 @@ def _group_norm_silu_kernel(
 
             # Normalize and apply affine
             norm_val = (x_val - mean) * rstd * weight_val + bias_val
+            if ROUND_NORM:
+                # Eager ``F.silu(norm(x))`` sees the GroupNorm output after it
+                # has been stored in the activation dtype.
+                norm_val = norm_val.to(out_ptr.dtype.element_ty).to(tl.float32)
 
             # Apply SiLU: x * sigmoid(x)
             out_val = norm_val * tl.sigmoid(norm_val)
@@ -144,6 +150,9 @@ def fused_group_norm_silu(
     bias: torch.Tensor,
     num_groups: int = 32,
     eps: float = 1e-6,
+    *,
+    per_frame: bool = False,
+    round_norm_output: bool = False,
 ) -> torch.Tensor:
     """
     Fused GroupNorm + SiLU activation.
@@ -157,6 +166,13 @@ def fused_group_norm_silu(
     - weight, bias: per-channel parameters, shape (C,).
     - num_groups: GroupNorm group count, default 32.
     - eps: numerical stability epsilon, default 1e-6.
+    - per_frame: treat x as (N, C, T, *spatial) and normalize every frame on its
+      own, i.e. GroupNorm over ``rearrange(x, "n c t ... -> (n t) c ...")``. The
+      kernel reads the frames in place, so neither that transpose nor its inverse
+      is materialized.
+    - round_norm_output: round the GroupNorm result to the output dtype before
+      SiLU, the boundary eager ``F.silu(F.group_norm(x))`` has. Off by default so
+      existing callers keep their numerics.
     Uses fp32 accumulation for numeric alignment with PyTorch.
     Returns the same shape and eager F.group_norm-compatible dtype.
     Spatial dimensions are flattened during computation and restored afterward;
@@ -165,9 +181,16 @@ def fused_group_norm_silu(
     """
     # Fallback if Triton not available (NPU, CPU, ...)
     if not HAS_TRITON:
+        if per_frame:
+            n, c, t = x.shape[:3]
+            frames = x.transpose(1, 2).reshape(n * t, c, *x.shape[3:])
+            out = F.silu(F.group_norm(frames, num_groups, weight, bias, eps))
+            return out.reshape(n, t, c, *x.shape[3:]).transpose(1, 2)
         return F.silu(F.group_norm(x, num_groups, weight, bias, eps))
 
     # Validate inputs
+    if per_frame:
+        assert x.ndim >= 4, f"Expected at least 4D input (N, C, T, *spatial) for per_frame, got {x.ndim}D"
     assert x.ndim >= 3, f"Expected at least 3D input (N, C, *spatial), got {x.ndim}D"
     assert x.size(1) % num_groups == 0, f"Channels {x.size(1)} must be divisible by num_groups {num_groups}"
     assert weight.ndim == 1 and weight.size(0) == x.size(1), (
@@ -187,8 +210,16 @@ def fused_group_norm_silu(
     # normalize the layout here and let the kernel assume a dense block.
     orig_shape = x.shape
     B, C = orig_shape[0], orig_shape[1]
-    x_flat = x.contiguous().reshape(B, C, -1)
-    spatial_size = x_flat.size(2)
+    if per_frame:
+        # One group row per (sample, frame); see ``group_channel_base``.
+        frames = orig_shape[2]
+        x_flat = x.contiguous().reshape(B, C, frames, -1)
+        spatial_size = x_flat.size(3)
+    else:
+        frames = 1
+        x_flat = x.contiguous().reshape(B, C, -1)
+        spatial_size = x_flat.size(2)
+    rows = B * frames
 
     # Allocate output with the dtype eager GroupNorm would return, so that the
     # fused path stays a drop-in replacement inside autocast regions.
@@ -201,13 +232,13 @@ def fused_group_norm_silu(
     # B=1 VAE decode, well under any modern SM count. Split the spatial axis so
     # the largest activations get enough CTAs to saturate memory; small ones fall
     # back to split=1, which is the original single-launch kernel.
-    split, split_chunk = pick_split(spatial_size, B, num_groups, x_flat.device)
+    split, split_chunk = pick_split(spatial_size, rows, num_groups, x_flat.device)
 
     ws = 0
     if split > 1:
-        ws = launch_partial_stats(x_flat, B, C, spatial_size, num_groups, split, split_chunk)
+        ws = launch_partial_stats(x_flat, rows, C, spatial_size, num_groups, split, split_chunk, frames=frames)
 
-    _group_norm_silu_kernel[(B * num_groups * split,)](
+    _group_norm_silu_kernel[(rows * num_groups * split,)](
         x_flat,
         out_flat,
         weight,
@@ -215,10 +246,11 @@ def fused_group_norm_silu(
         ws,
         C,
         spatial_size,
-        1,
+        frames,
         split_chunk,
         num_groups=num_groups,
         eps=eps,
+        ROUND_NORM=round_norm_output,
         SPLIT=split,
         SPLIT_POW2=1 << (split - 1).bit_length(),
     )
