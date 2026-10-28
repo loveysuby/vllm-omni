@@ -95,7 +95,7 @@ def _adaptive_group_norm_silu_kernel(
         lo = 0
         hi = spatial_size
         n_total, mean, m2_total = welford_group_range(
-            x_ptr, n_idx, g_idx, C, spatial_size, group_size, lo, hi, BLOCK_SIZE, num_stages
+            x_ptr, n_idx, g_idx, C, spatial_size, 1, group_size, lo, hi, BLOCK_SIZE, num_stages
         )
     else:
         lo = s * split_chunk

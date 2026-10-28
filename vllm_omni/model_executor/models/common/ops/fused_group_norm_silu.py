@@ -37,6 +37,7 @@ from vllm_omni.model_executor.models.common.ops._group_norm_reduction import (
     SPLIT_REDUCTION_CONFIGS,
     SPLIT_REDUCTION_KEY,
     SPLIT_REDUCTION_PRUNE,
+    group_channel_base,
     launch_partial_stats,
     pick_split,
     welford_combine,
@@ -55,9 +56,11 @@ def _group_norm_silu_kernel(
     bias_ptr,
     # Partial-statistics workspace, unused (and passed as 0) when SPLIT == 1
     ws_ptr,
-    # Shape info; x is contiguous (N, C, spatial_size)
+    # Shape info; x is contiguous (N, C, spatial_size), or (N, C, frames,
+    # spatial_size) with one group row per frame when frames > 1
     C,
     spatial_size,
+    frames,
     split_chunk,
     num_groups: tl.constexpr,
     eps: tl.constexpr,
@@ -99,7 +102,7 @@ def _group_norm_silu_kernel(
         lo = 0
         hi = spatial_size
         n_total, mean, m2_total = welford_group_range(
-            x_ptr, n_idx, g_idx, C, spatial_size, group_size, lo, hi, BLOCK_SIZE, num_stages
+            x_ptr, n_idx, g_idx, C, spatial_size, frames, group_size, lo, hi, BLOCK_SIZE, num_stages
         )
     else:
         lo = s * split_chunk
@@ -112,7 +115,7 @@ def _group_norm_silu_kernel(
     # === Pass 2: normalize this program's slice, apply affine, and SiLU ===
     for c_offset in range(group_size):
         c_idx = g_idx * group_size + c_offset
-        base = n_idx * C * spatial_size + c_idx * spatial_size
+        base = group_channel_base(n_idx, c_idx, C, spatial_size, frames)
 
         weight_val = tl.load(weight_ptr + c_idx).to(tl.float32)
         bias_val = tl.load(bias_ptr + c_idx).to(tl.float32)
@@ -212,6 +215,7 @@ def fused_group_norm_silu(
         ws,
         C,
         spatial_size,
+        1,
         split_chunk,
         num_groups=num_groups,
         eps=eps,
