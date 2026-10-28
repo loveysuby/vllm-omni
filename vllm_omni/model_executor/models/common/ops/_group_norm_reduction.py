@@ -234,10 +234,15 @@ def group_channel_base(n_idx, c_idx, C, spatial_size, frames):
 
     The offset is computed in int64. A whole-clip video activation can exceed
     2**31 elements (e.g. 128 channels x 17 frames at 1080p), which int32
-    arithmetic on these indices would overflow.
+    arithmetic on these indices would overflow. Every operand is cast so no
+    product depends on mixed-width promotion. ``tl.cast`` rather than ``.to``
+    because callers may pass ``frames`` as the literal ``1``, a constexpr.
     """
-    n_idx = n_idx.to(tl.int64)
-    c_idx = c_idx.to(tl.int64)
+    n_idx = tl.cast(n_idx, tl.int64)
+    c_idx = tl.cast(c_idx, tl.int64)
+    C = tl.cast(C, tl.int64)
+    spatial_size = tl.cast(spatial_size, tl.int64)
+    frames = tl.cast(frames, tl.int64)
     channel_stride = frames * spatial_size
     return (n_idx // frames) * C * channel_stride + (n_idx % frames) * spatial_size + c_idx * channel_stride
 
