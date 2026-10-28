@@ -7,6 +7,8 @@ Tests numeric correctness against PyTorch native implementation:
     F.silu(F.group_norm(x, num_groups, weight, bias, eps))
 """
 
+import importlib
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -602,6 +604,21 @@ def test_round_norm_output_follows_eager_fp16_boundary():
 
     torch.testing.assert_close(rounded, eager, rtol=2e-3, atol=2e-3)
     assert (rounded != eager).sum() <= (unrounded != eager).sum()
+
+
+def test_per_frame_fallback_is_contiguous(monkeypatch):
+    """Without Triton the per-frame path returns contiguous NCTHW, like the kernel."""
+    module = importlib.import_module("vllm_omni.model_executor.models.common.ops.fused_group_norm_silu")
+    monkeypatch.setattr(module, "HAS_TRITON", False)
+    torch.manual_seed(0)
+    x = torch.randn(1, 64, 3, 8, 8)
+    weight = torch.randn(64)
+    bias = torch.randn(64)
+
+    out = fused_group_norm_silu(x, weight, bias, 32, 1e-6, per_frame=True)
+
+    assert out.is_contiguous()
+    torch.testing.assert_close(out, _per_frame_reference(x, weight, bias), rtol=1e-5, atol=1e-6)
 
 
 if __name__ == "__main__":

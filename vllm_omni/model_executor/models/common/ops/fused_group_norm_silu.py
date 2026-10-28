@@ -185,7 +185,8 @@ def fused_group_norm_silu(
             n, c, t = x.shape[:3]
             frames = x.transpose(1, 2).reshape(n * t, c, *x.shape[3:])
             out = F.silu(F.group_norm(frames, num_groups, weight, bias, eps))
-            return out.reshape(n, t, c, *x.shape[3:]).transpose(1, 2)
+            # Contiguous like the Triton path, so both share one layout contract.
+            return out.reshape(n, t, c, *x.shape[3:]).transpose(1, 2).contiguous()
         return F.silu(F.group_norm(x, num_groups, weight, bias, eps))
 
     # Validate inputs
