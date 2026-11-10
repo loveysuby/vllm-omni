@@ -415,7 +415,7 @@ class TestInt8LinearMethod:
 
         assert method.quant_config == mock_quant_config
         init_int8_linear_kernel.assert_called_once_with(
-            is_channelwise=False, is_static_input_scheme=False, input_symmetric=True, module_name="Int8LinearMethod"
+            is_channelwise=True, is_static_input_scheme=False, input_symmetric=True, module_name="Int8LinearMethod"
         )
         assert method.int8_linear == patch_deps
 
@@ -440,6 +440,43 @@ class TestInt8LinearMethod:
 
         patch_deps.apply_weights.assert_called_once_with(layer, x, bias)
         assert isinstance(output, torch.Tensor)
+
+    def test_serialized_fused_layer_keeps_per_channel_weight_scales(self, mocker: MockerFixture):
+        """Serialized INT8 stores one weight scale per output channel (ChannelQuantScaleParameter).
+
+        The CUTLASS kernel expands one scale per logical partition to every channel of a fused
+        layer (QKV, gate-up) unless the kernel config is channelwise.
+        """
+        from vllm.model_executor.kernels.linear.scaled_mm import cutlass
+        from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import Int8ScaledMMLinearLayerConfig
+
+        from vllm_omni.quantization.int8_config import DiffusionInt8Config, Int8LinearMethod
+
+        # Build the real CUTLASS kernel on CPU tensors; only its weight post-processing runs here.
+        mocker.patch.object(cutlass.current_platform, "is_cuda", return_value=True)
+
+        def cutlass_kernel(*, is_channelwise, is_static_input_scheme, input_symmetric, module_name, **kwargs):
+            config = Int8ScaledMMLinearLayerConfig(
+                is_channelwise=is_channelwise,
+                is_static_input_scheme=is_static_input_scheme,
+                input_symmetric=input_symmetric,
+            )
+            return cutlass.CutlassInt8ScaledMMLinearKernel(
+                config, layer_param_names=["weight", "weight_scale", "input_scale", "input_zero_point", "azp_adj"]
+            )
+
+        mocker.patch("vllm_omni.quantization.int8_config.init_int8_linear_kernel", side_effect=cutlass_kernel)
+
+        layer = Module()
+        layer.logical_widths = [64, 64, 64]
+        layer.weight = Parameter(torch.randint(-127, 128, (192, 64), dtype=torch.int8), requires_grad=False)
+        weight_scale = torch.arange(1, 193, dtype=torch.float32).reshape(192, 1) / 100
+        layer.weight_scale = Parameter(weight_scale.clone(), requires_grad=False)
+
+        method = Int8LinearMethod(DiffusionInt8Config(is_checkpoint_int8_serialized=True))
+        method.process_weights_after_loading(layer)
+
+        torch.testing.assert_close(layer.weight_scale.data, weight_scale, rtol=0, atol=0)
 
 
 class TestInt8OnlineLinearMethod:
