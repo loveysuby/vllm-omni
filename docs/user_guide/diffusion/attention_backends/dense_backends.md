@@ -145,6 +145,8 @@ config = OmniDiffusionConfig(
 ```
 
 `dtype_qk` controls Q and K; `dtype_vo` controls V. Mixed-dtype
-configurations require FlashInfer 0.6.16rc1 or newer. The shared quantization
+configurations require FlashInfer 0.6.16rc1 or newer and the `cute-dsl`
+backend (Blackwell). `fa2` and `fa3` read V with the K dtype, so they reject a
+V dtype that differs from Q/K. The shared quantization
 schema is also consumed by TRTLLM, but each backend validates its own allowed
 fields and values; see [TRTLLM SAGE quantization](trtllm.md#sage-quantization).
