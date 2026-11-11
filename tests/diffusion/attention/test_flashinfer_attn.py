@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -127,6 +129,83 @@ def test_hopper_explicit_flashinfer_is_mask_capable(monkeypatch):
     spec = AttentionSpec(backend="FLASHINFER_ATTN")
 
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("backend", "k_dtype", "v_dtype"),
+    [
+        ("fa2", torch.bfloat16, torch.float8_e4m3fn),
+        ("fa3", torch.bfloat16, torch.float8_e4m3fn),
+        ("fa2", None, torch.float8_e4m3fn),
+        ("fa2", torch.float16, torch.bfloat16),
+    ],
+)
+def test_single_kv_dtype_backend_rejects_mixed_kv_dtypes(backend, k_dtype, v_dtype):
+    with pytest.raises(ValueError, match="reads V with the K dtype"):
+        FlashInferAttentionImpl._check_kv_dtypes(backend, k_dtype, v_dtype)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("backend", "k_dtype", "v_dtype"),
+    [
+        ("cute-dsl", torch.bfloat16, torch.float8_e4m3fn),
+        ("fa2", torch.bfloat16, torch.bfloat16),
+        ("fa3", torch.float16, torch.float16),
+    ],
+)
+def test_kv_dtype_check_allows_supported_combinations(backend, k_dtype, v_dtype):
+    FlashInferAttentionImpl._check_kv_dtypes(backend, k_dtype, v_dtype)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+@pytest.mark.parametrize("dtype_qk", ["bfloat16", None])
+def test_init_rejects_fp8_v_on_single_kv_dtype_backend(monkeypatch, backend, dtype_qk):
+    # Stop before CUDA allocation: the check runs right after backend selection.
+    monkeypatch.setattr(flashinfer_attn, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(flashinfer_attn, "flashinfer", SimpleNamespace(__version__="0.7.2"), raising=False)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+
+    with pytest.raises(ValueError, match="reads V with the K dtype"):
+        FlashInferAttentionImpl(
+            num_heads=2,
+            head_size=128,
+            softmax_scale=128**-0.5,
+            backend_kwargs={
+                "quant": {"flashinfer_backend": backend, "dtype_qk": dtype_qk, "dtype_vo": "fp8_e4m3"},
+            },
+        )
+
+
+@pytest.mark.cpu
+def test_plan_rejects_mixed_kv_dtypes_on_fa2():
+    # dtype_qk alone cannot be checked at init: V keeps the input dtype.
+    impl = _impl()
+    impl._qo_indptr = torch.zeros(2, dtype=torch.int32)
+    impl._kv_indptr = torch.zeros(2, dtype=torch.int32)
+    impl._wrapper = SimpleNamespace(plan=lambda *args, **kwargs: pytest.fail("unexpected plan"))
+    key = FlashInferAttentionImpl._WrapperPlanKey(
+        batch_size=1,
+        qo_len=4,
+        kv_len=4,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim_qk=8,
+        head_dim_k=8,
+        head_dim_vo=8,
+        q_dtype=torch.float16,
+        k_dtype=torch.float16,
+        v_dtype=torch.bfloat16,
+        o_dtype=torch.bfloat16,
+        causal=False,
+        softmax_scale=0.5,
+        has_custom_mask=False,
+    )
+
+    with pytest.raises(ValueError, match="reads V with the K dtype"):
+        impl._plan_wrapper(key, None)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
