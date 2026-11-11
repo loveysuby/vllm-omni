@@ -181,6 +181,9 @@ class FlashInferAttentionBackend(AttentionBackend):
 class FlashInferAttentionImpl(AttentionImpl):
     _QK_DTYPES = {torch.float16, torch.bfloat16}
     _VO_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
+    # fa2 and fa3 compile one kernel per K/V dtype and read V as the K dtype,
+    # so they cannot run a V dtype that differs from K.
+    _SINGLE_KV_DTYPE_BACKENDS = frozenset({"fa2", "fa3"})
 
     @dataclass(frozen=True)
     class _WrapperPlanKey:
@@ -230,6 +233,10 @@ class FlashInferAttentionImpl(AttentionImpl):
         self._check_flashinfer_version()
 
         self.flashinfer_backend = self._select_backend(requested_backend, device=self.device)
+        # Q/K are always 16-bit, so an 8-bit V differs from them even when
+        # dtype_qk is unset. Other unset cases are checked at plan time.
+        if self.dtype_vo is not None and (self.dtype_qk is not None or torch.finfo(self.dtype_vo).bits == 8):
+            self._check_kv_dtypes(self.flashinfer_backend, self.dtype_qk, self.dtype_vo)
 
         workspace_size = 0 if self.flashinfer_backend == "cute-dsl" else 128 * 1024 * 1024
         self._workspace = torch.empty(
@@ -293,6 +300,21 @@ class FlashInferAttentionImpl(AttentionImpl):
         if major >= 9:
             return "fa3"
         return "fa2"
+
+    @classmethod
+    def _check_kv_dtypes(
+        cls,
+        backend: str,
+        k_dtype: torch.dtype | None,
+        v_dtype: torch.dtype,
+    ) -> None:
+        if backend not in cls._SINGLE_KV_DTYPE_BACKENDS or k_dtype == v_dtype:
+            return
+        raise ValueError(
+            f"FLASHINFER_ATTN backend {backend!r} cannot run Q/K={k_dtype or 'input dtype'} "
+            f"with V={v_dtype}: it reads V with the K dtype. Use the same dtype for "
+            "Q/K and V, or flashinfer_backend='cute-dsl' on Blackwell."
+        )
 
     @classmethod
     def _check_dtype(
@@ -390,6 +412,7 @@ class FlashInferAttentionImpl(AttentionImpl):
         key: _WrapperPlanKey,
         flat_mask: torch.Tensor | None,
     ) -> None:
+        self._check_kv_dtypes(self.flashinfer_backend, key.k_dtype, key.v_dtype)
         self._wrapper.plan(
             self._qo_indptr,
             self._kv_indptr,
@@ -401,8 +424,9 @@ class FlashInferAttentionImpl(AttentionImpl):
             causal=key.causal,
             sm_scale=key.softmax_scale,
             q_data_type=key.q_dtype,
-            # FlashInfer versions newer than 0.6.15 can dispatch K and V with
-            # independent runtime dtypes even though plan() names this K/V.
+            # plan() names this K/V. FlashInfer newer than 0.6.15 lets the
+            # cute-dsl backend take a different V dtype at run time; fa2 and
+            # fa3 do not (see _check_kv_dtypes).
             kv_data_type=key.k_dtype,
             o_data_type=key.o_dtype,
         )
